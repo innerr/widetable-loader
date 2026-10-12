@@ -92,6 +92,23 @@ func Run(args []string) error {
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
 
+	// Sidecar column list for the loader's LOAD DATA / INSERT statements:
+	// one column name per line, in file order.
+	if *out != "" {
+		cf, err := os.Create(*out + ".columns")
+		if err != nil {
+			return err
+		}
+		defer cf.Close()
+		fmt.Fprintln(cf, "id")
+		for c := 1; c <= *fixedCols; c++ {
+			fmt.Fprintf(cf, "f%d\n", c)
+		}
+		for c := 1; c <= *poolSize; c++ {
+			fmt.Fprintf(cf, "c%06d\n", c)
+		}
+	}
+
 	rng := rand.New(rand.NewSource(int64(*seed*1000003 + *segment)))
 	// Long values are carried by string/json columns only (2 of 5 rotated
 	// types), so spread the target width over them, not over all filled
