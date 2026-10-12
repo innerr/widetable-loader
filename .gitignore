@@ -1,0 +1,4 @@
+*.csv
+widetable-loader
+*.test
+/dist/
