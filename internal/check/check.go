@@ -41,7 +41,7 @@ func Run(args []string) error {
 	fs.Uint64Var(&cfg.GapFactor, "gap-factor", 10, "blocked gap factor (must match gen)")
 	fs.Uint64Var(&cfg.Seed, "seed", 1, "random seed (must match gen)")
 	fs.IntVar(&cfg.Fields, "fields", 5000, "declared column count (must match gen)")
-	fs.IntVar(&cfg.PoolSize, "pool-size", 0, "declared columns in the load file (must match gen)")
+	fs.IntVar(&cfg.FileCols, "file-cols", 0, "declared columns in the load file (must match gen)")
 	fs.IntVar(&cfg.FixedCols, "fixed-cols", 6, "fixed column count (must match gen)")
 	fs.IntVar(&cfg.IndexFields, "index-fields", 15, "indexed declared columns (must match gen)")
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (must match gen)")
@@ -52,8 +52,8 @@ func Run(args []string) error {
 	if *dsn == "" || *table == "" || cfg.TotalRows == 0 {
 		return fmt.Errorf("--dsn, --table and --total-rows are required")
 	}
-	if cfg.PoolSize == 0 {
-		cfg.PoolSize = cfg.Fields
+	if cfg.FileCols == 0 {
+		cfg.FileCols = cfg.Fields
 	}
 
 	db, err := sql.Open("mysql", *dsn)
@@ -144,7 +144,7 @@ func Run(args []string) error {
 }
 
 // checkRow compares one expected record against the stored row.
-// record layout: [id, f1..fF, c000001..cPool].
+// record layout: [id, f1..fF, c000001..cFileCols].
 func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Config, rec []string) bool {
 	id := rec[0]
 	rows, err := db.Query(fmt.Sprintf("SELECT %s FROM `%s` WHERE id = %s", colList, table, id))
