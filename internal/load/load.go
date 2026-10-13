@@ -101,6 +101,9 @@ func Run(args []string) error {
 
 // loadSegment loads one segment file in a single session.
 func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, unsorted bool, doneRows *int64) error {
+	if entry == "insert" {
+		dsn = ensureDSNParam(dsn, "multiStatements", "true")
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return err
@@ -171,6 +174,11 @@ func readColumns(path string) ([]string, error) {
 
 // insertFile replays a CSV segment as multi-row INSERT statements. Every
 // field is emitted as a quoted SQL string literal; the server coerces types.
+// insertFile replays a CSV segment as per-row INSERT statements, each
+// carrying only the row's filled columns (sparse writes are the target
+// shape: rows of a wide table fill a small subset of the column pool).
+// batchRows statements are joined with ';' into one multi-statement Exec
+// (requires multiStatements in the DSN; loadSegment ensures it).
 func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64) error {
 	f, err := os.Open(file)
 	if err != nil {
@@ -178,12 +186,10 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 	}
 	defer f.Close()
 
-	head := fmt.Sprintf("INSERT INTO %s (%s) VALUES ", table, strings.Join(cols, ","))
 	r := csv.NewReader(bufio.NewReaderSize(f, 4*1024*1024))
 	r.ReuseRecord = true
 
 	var sb strings.Builder
-	sb.WriteString(head)
 	n := 0
 	flush := func() error {
 		if n == 0 {
@@ -194,10 +200,11 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 		}
 		atomic.AddInt64(doneRows, int64(n))
 		sb.Reset()
-		sb.WriteString(head)
 		n = 0
 		return nil
 	}
+	// Scratch buffers for one row's column list / value list.
+	var rowCols, rowVals []string
 	for {
 		rec, err := r.Read()
 		if err != nil {
@@ -206,23 +213,22 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 			}
 			return err
 		}
-		if n > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteByte('(')
+		rowCols = rowCols[:0]
+		rowVals = rowVals[:0]
 		for i, v := range rec {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
 			if v == `\N` {
-				sb.WriteString("NULL")
 				continue
 			}
-			sb.WriteByte('\'')
-			sb.WriteString(escapeSQL(v))
-			sb.WriteByte('\'')
+			rowCols = append(rowCols, cols[i])
+			rowVals = append(rowVals, "'"+escapeSQL(v)+"'")
 		}
-		sb.WriteByte(')')
+		sb.WriteString("INSERT INTO ")
+		sb.WriteString(table)
+		sb.WriteString(" (")
+		sb.WriteString(strings.Join(rowCols, ","))
+		sb.WriteString(") VALUES (")
+		sb.WriteString(strings.Join(rowVals, ","))
+		sb.WriteString(");")
 		n++
 		if n >= batchRows {
 			if err := flush(); err != nil {
@@ -240,6 +246,18 @@ func escapeSQL(s string) string {
 	}
 	r := strings.NewReplacer("\\", "\\\\", "'", "\\'")
 	return r.Replace(s)
+}
+
+// ensureDSNParam appends ?param=value to the DSN unless already present.
+func ensureDSNParam(dsn, param, value string) string {
+	if strings.Contains(dsn, param+"=") {
+		return dsn
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + param + "=" + value
 }
 
 // loadProgress reads the per-segment progress file.
