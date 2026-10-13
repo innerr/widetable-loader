@@ -21,7 +21,7 @@ func Run(args []string) error {
 	fs.Uint64Var(&cfg.GapFactor, "gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor (gap is left for post-import writes)")
 	fs.Uint64Var(&cfg.Seed, "seed", 1, "random seed; regenerated data is byte-identical for the same seed and parameters")
 	fs.IntVar(&cfg.Fields, "fields", 5000, "declared column count in the table schema (c000001..cN)")
-	fs.IntVar(&cfg.PoolSize, "pool-size", 0, "declared columns present in the output file (default = fields); a smaller pool cuts the per-row delimiter overhead of empty columns")
+	fs.IntVar(&cfg.FileCols, "file-cols", 0, "declared columns present in the output file (default = fields); a smaller column set cuts the per-row delimiter overhead of empty columns")
 	fs.IntVar(&cfg.FixedCols, "fixed-cols", 6, "fixed column count (always filled)")
 	fs.IntVar(&cfg.IndexFields, "index-fields", 15, "declared columns carrying a secondary index (filled on every row)")
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (index fields included)")

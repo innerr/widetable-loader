@@ -29,7 +29,7 @@ type Config struct {
 	GapFactor   uint64
 	Seed        uint64
 	Fields      int
-	PoolSize    int
+	FileCols    int
 	FixedCols   int
 	IndexFields int
 	Fill        int
@@ -80,11 +80,11 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 	if cfg.Fill > cfg.Fields || cfg.IndexFields > cfg.Fill {
 		return nil, fmt.Errorf("require index-fields <= fill <= fields")
 	}
-	if cfg.PoolSize == 0 {
-		cfg.PoolSize = cfg.Fields
+	if cfg.FileCols == 0 {
+		cfg.FileCols = cfg.Fields
 	}
-	if cfg.PoolSize > cfg.Fields || cfg.Fill > cfg.PoolSize {
-		return nil, fmt.Errorf("require fill <= pool-size <= fields")
+	if cfg.FileCols > cfg.Fields || cfg.Fill > cfg.FileCols {
+		return nil, fmt.Errorf("require fill <= file-cols <= fields")
 	}
 	layout, err := cfg.layout(segment)
 	if err != nil {
@@ -94,8 +94,8 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 		cfg:    cfg,
 		layout: layout,
 		rng:    rand.New(rand.NewSource(int64(cfg.Seed*1000003 + segment))),
-		perm:   make([]int, cfg.PoolSize-cfg.IndexFields),
-		record: make([]string, 1+cfg.FixedCols+cfg.PoolSize),
+		perm:   make([]int, cfg.FileCols-cfg.IndexFields),
+		record: make([]string, 1+cfg.FixedCols+cfg.FileCols),
 		row0:   segment * cfg.RowsPerSeg(),
 	}
 	g.row1 = g.row0 + cfg.RowsPerSeg()
@@ -146,14 +146,14 @@ func (g *Generator) Next(seq uint64) ([]string, error) {
 	return g.record, nil
 }
 
-// ColumnNames returns the file/header column order (id, fixed, declared pool).
+// ColumnNames returns the file/header column order (id, fixed, declared set in the file).
 func (cfg Config) ColumnNames() []string {
-	names := make([]string, 0, 1+cfg.FixedCols+cfg.PoolSize)
+	names := make([]string, 0, 1+cfg.FixedCols+cfg.FileCols)
 	names = append(names, "id")
 	for c := 1; c <= cfg.FixedCols; c++ {
 		names = append(names, fmt.Sprintf("f%d", c))
 	}
-	for c := 1; c <= cfg.PoolSize; c++ {
+	for c := 1; c <= cfg.FileCols; c++ {
 		names = append(names, fmt.Sprintf("c%06d", c))
 	}
 	return names
