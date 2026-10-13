@@ -23,7 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 // Run parses flags and loads all segment files with a worker pool.
@@ -126,8 +126,10 @@ func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, u
 
 	switch entry {
 	case "csv":
+		mysql.RegisterLocalFile(file)
+		defer mysql.DeregisterLocalFile(file)
 		stmt := fmt.Sprintf(
-			"LOAD DATA INFILE '%s' INTO TABLE %s FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' LINES TERMINATED BY '\\n' (%s)",
+			"LOAD DATA LOCAL INFILE '%s' INTO TABLE %s FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' LINES TERMINATED BY '\\n' (%s)",
 			file, table, strings.Join(cols, ","))
 		res, err := db.Exec(stmt)
 		if err != nil {

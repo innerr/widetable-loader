@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/innerr/widetable-loader/internal/check"
 	"github.com/innerr/widetable-loader/internal/gen"
 	"github.com/innerr/widetable-loader/internal/load"
 )
@@ -32,7 +33,9 @@ func main() {
 		err = gen.Run(os.Args[2:])
 	case "load":
 		err = load.Run(os.Args[2:])
-	case "split", "check", "bench":
+	case "check":
+		err = check.Run(os.Args[2:])
+	case "split", "bench":
 		err = fmt.Errorf("%s: not implemented yet", os.Args[1])
 	default:
 		usage()
