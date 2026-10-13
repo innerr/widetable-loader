@@ -214,6 +214,10 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 			if i > 0 {
 				sb.WriteByte(',')
 			}
+			if v == `\N` {
+				sb.WriteString("NULL")
+				continue
+			}
 			sb.WriteByte('\'')
 			sb.WriteString(escapeSQL(v))
 			sb.WriteByte('\'')
