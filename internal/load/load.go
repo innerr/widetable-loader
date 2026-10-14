@@ -36,6 +36,7 @@ func Run(args []string) error {
 		workers   = fs.Int("workers", 1, "concurrent sessions (one segment at a time each)")
 		entry     = fs.String("entry", "csv", "entry: csv (LOAD DATA) | insert (multi-row INSERT)")
 		batchRows = fs.Int("batch-rows", 1000, "insert entry: rows per INSERT statement")
+		multiRow  = fs.Int("multi-row", 0, "insert entry: group rows sharing a column set into multi-row VALUES (0=off)")
 		bulk      = fs.Bool("bulk", false, "enable SST bulk load mode (tdsql_bulk_load family) for this session")
 		allowSK   = fs.Bool("allow-sk", false, "with --bulk: allow tables with secondary keys")
 		unsorted  = fs.Bool("allow-unsorted", false, "with --bulk: input rows are unordered")
@@ -77,7 +78,7 @@ func Run(args []string) error {
 		go func() {
 			defer wg.Done()
 			for f := range queue {
-				if err := loadSegment(*dsn, *table, f, *entry, *batchRows, *bulk, *allowSK, *unsorted, &doneRows); err != nil {
+				if err := loadSegment(*dsn, *table, f, *entry, *batchRows, *bulk, *allowSK, *unsorted, *multiRow, &doneRows); err != nil {
 					errCh <- fmt.Errorf("%s: %w", f, err)
 					return
 				}
@@ -100,7 +101,7 @@ func Run(args []string) error {
 }
 
 // loadSegment loads one segment file in a single session.
-func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, unsorted bool, doneRows *int64) error {
+func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, unsorted bool, multiRow int, doneRows *int64) error {
 	if entry == "insert" {
 		dsn = ensureDSNParam(dsn, "multiStatements", "true")
 	}
@@ -142,7 +143,7 @@ func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, u
 		atomic.AddInt64(doneRows, n)
 		return nil
 	case "insert":
-		return insertFile(db, table, file, cols, batchRows, doneRows)
+		return insertFile(db, table, file, cols, batchRows, doneRows, multiRow)
 	default:
 		return fmt.Errorf("unknown --entry %q (csv | insert)", entry)
 	}
@@ -179,7 +180,10 @@ func readColumns(path string) ([]string, error) {
 // shape: rows of a wide table fill a small subset of the column pool).
 // batchRows statements are joined with ';' into one multi-statement Exec
 // (requires multiStatements in the DSN; loadSegment ensures it).
-func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64) error {
+func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64, multiRow int) error {
+	if multiRow > 0 {
+		return insertFileMultiRow(db, table, file, cols, batchRows, doneRows, multiRow)
+	}
 	f, err := os.Open(file)
 	if err != nil {
 		return err
@@ -241,7 +245,104 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 	return flush()
 }
 
-// escapeSQL escapes a value for use inside a single-quoted SQL literal.
+// insertFileMultiRow groups rows sharing the same non-null column set into
+// multi-row VALUES statements: one INSERT covers many rows, cutting the
+// per-statement parse/execute cost that dominates SQL-layer throughput.
+// Rows with a unique column set fall back to single-row statements.
+func insertFileMultiRow(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64, multiRow int) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(bufio.NewReaderSize(f, 4*1024*1024))
+	r.ReuseRecord = false // rows are buffered across groups
+
+	var sb strings.Builder
+	n := 0 // rows in current txn batch
+	// pending group: column signature -> statement pieces
+	type group struct {
+		cols string
+		name []string
+		vals []string
+		rows int
+	}
+	groups := map[string]*group{}
+	var order []*group // deterministic flush order
+
+	flushGroup := func(g *group) {
+		if g.rows == 0 {
+			return
+		}
+		sb.WriteString("INSERT INTO ")
+		sb.WriteString(table)
+		sb.WriteString(" (")
+		sb.WriteString(g.cols)
+		sb.WriteString(") VALUES ")
+		sb.WriteString(strings.Join(g.vals, ","))
+		sb.WriteString(";")
+		n += g.rows
+		g.vals = g.vals[:0]
+		g.rows = 0
+	}
+	flush := func() error {
+		if n == 0 {
+			return nil
+		}
+		for _, g := range order {
+			flushGroup(g)
+		}
+		if _, err := db.Exec("BEGIN;" + sb.String() + "COMMIT"); err != nil {
+			return err
+		}
+		atomic.AddInt64(doneRows, int64(n))
+		sb.Reset()
+		n = 0
+		return nil
+	}
+
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		var names []string
+		var vals []string
+		for i, v := range rec {
+			if v == `\N` {
+				continue
+			}
+			names = append(names, cols[i])
+			vals = append(vals, "'"+escapeSQL(v)+"'")
+		}
+		sig := strings.Join(names, ",")
+		g := groups[sig]
+		if g == nil {
+			g = &group{cols: sig, name: names}
+			groups[sig] = g
+			order = append(order, g)
+		}
+		g.vals = append(g.vals, "("+strings.Join(vals, ",")+")")
+		g.rows++
+		if g.rows >= multiRow {
+			flushGroup(g)
+		}
+		if n >= batchRows {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	// flush remaining rows
+	for _, g := range order {
+		flushGroup(g)
+	}
+	return flush()
+}
 func escapeSQL(s string) string {
 	if !strings.ContainsAny(s, "'\\") {
 		return s
