@@ -2,3 +2,4 @@
 widetable-loader
 *.test
 /dist/
+widetable-loader-linux-amd64
