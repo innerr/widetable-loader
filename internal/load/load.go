@@ -195,7 +195,9 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 		if n == 0 {
 			return nil
 		}
-		if _, err := db.Exec(sb.String()); err != nil {
+		// Wrap the batch in an explicit transaction: one txn per batch
+		// instead of one autocommit txn per row. sb ends with ";".
+		if _, err := db.Exec("BEGIN;" + sb.String() + "COMMIT"); err != nil {
 			return err
 		}
 		atomic.AddInt64(doneRows, int64(n))
