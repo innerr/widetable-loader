@@ -26,6 +26,7 @@ func Run(args []string) error {
 	fs.IntVar(&cfg.IndexFields, "index-fields", 15, "declared columns carrying a secondary index (filled on every row)")
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (index fields included)")
 	fs.IntVar(&cfg.RowWidth, "row-width", 1024, "target row width in bytes")
+	fs.IntVar(&cfg.FillBuckets, "fill-buckets", 0, ">0: cycle through N pre-picked column sets instead of per-row random (enables multi-row INSERT)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

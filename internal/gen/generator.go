@@ -34,6 +34,7 @@ type Config struct {
 	IndexFields int
 	Fill        int
 	RowWidth    int
+	FillBuckets int // >0: cycle through this many pre-picked column sets instead of per-row random
 }
 
 // RowsPerSeg is the fixed row count of every segment.
@@ -68,6 +69,8 @@ type Generator struct {
 	strLen  int
 	perm    []int
 	record  []string
+	buckets [][]int // FillBuckets pre-picked column sets (nil when off)
+	rowIdx  uint64   // row counter for bucket cycling
 	row0    uint64 // first global sequence of the segment
 	row1    uint64 // one past the last
 	pending uint64 // next seq to emit
@@ -138,6 +141,29 @@ func (g *Generator) Next(seq uint64) ([]string, error) {
 	}
 	// The rest: partial Fisher-Yates to pick fill-indexFields columns.
 	need := cfg.Fill - cfg.IndexFields
+	if cfg.FillBuckets > 0 {
+		if len(g.buckets) == 0 {
+			// Pre-pick FillBuckets column sets once (deterministic from rng).
+			g.buckets = make([][]int, cfg.FillBuckets)
+			for b := range g.buckets {
+				perm := make([]int, len(g.perm))
+				copy(perm, g.perm)
+				set := make([]int, need)
+				for i := 0; i < need; i++ {
+					j := i + g.rng.Intn(len(perm)-i)
+					perm[i], perm[j] = perm[j], perm[i]
+					set[i] = perm[i]
+				}
+				g.buckets[b] = set
+			}
+		}
+		set := g.buckets[int(g.rowIdx)%cfg.FillBuckets]
+		for _, c := range set {
+			g.record[1+cfg.FixedCols+c] = value(c, seq, g.strLen, g.rng)
+		}
+		g.rowIdx++
+		return g.record, nil
+	}
 	for i := 0; i < need; i++ {
 		j := i + g.rng.Intn(len(g.perm)-i)
 		g.perm[i], g.perm[j] = g.perm[j], g.perm[i]
