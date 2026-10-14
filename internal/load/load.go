@@ -9,6 +9,7 @@ package load
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"errors"
@@ -37,6 +38,7 @@ func Run(args []string) error {
 		entry     = fs.String("entry", "csv", "entry: csv (LOAD DATA) | insert (multi-row INSERT)")
 		batchRows = fs.Int("batch-rows", 1000, "insert entry: rows per INSERT statement")
 		multiRow  = fs.Int("multi-row", 0, "insert entry: group rows sharing a column set into multi-row VALUES (0=off)")
+		prepared  = fs.Bool("prepared", false, "insert entry: one prepared statement per column signature (requires fill-buckets data)")
 		bulk      = fs.Bool("bulk", false, "enable SST bulk load mode (tdsql_bulk_load family) for this session")
 		allowSK   = fs.Bool("allow-sk", false, "with --bulk: allow tables with secondary keys")
 		unsorted  = fs.Bool("allow-unsorted", false, "with --bulk: input rows are unordered")
@@ -78,7 +80,7 @@ func Run(args []string) error {
 		go func() {
 			defer wg.Done()
 			for f := range queue {
-				if err := loadSegment(*dsn, *table, f, *entry, *batchRows, *bulk, *allowSK, *unsorted, *multiRow, &doneRows); err != nil {
+				if err := loadSegment(*dsn, *table, f, *entry, *batchRows, *bulk, *allowSK, *unsorted, *multiRow, *prepared, &doneRows); err != nil {
 					errCh <- fmt.Errorf("%s: %w", f, err)
 					return
 				}
@@ -101,7 +103,7 @@ func Run(args []string) error {
 }
 
 // loadSegment loads one segment file in a single session.
-func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, unsorted bool, multiRow int, doneRows *int64) error {
+func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, unsorted bool, multiRow int, prepared bool, doneRows *int64) error {
 	if entry == "insert" {
 		dsn = ensureDSNParam(dsn, "multiStatements", "true")
 	}
@@ -143,7 +145,7 @@ func loadSegment(dsn, table, file, entry string, batchRows int, bulk, allowSK, u
 		atomic.AddInt64(doneRows, n)
 		return nil
 	case "insert":
-		return insertFile(db, table, file, cols, batchRows, doneRows, multiRow)
+		return insertFile(db, table, file, cols, batchRows, doneRows, multiRow, prepared)
 	default:
 		return fmt.Errorf("unknown --entry %q (csv | insert)", entry)
 	}
@@ -180,7 +182,10 @@ func readColumns(path string) ([]string, error) {
 // shape: rows of a wide table fill a small subset of the column pool).
 // batchRows statements are joined with ';' into one multi-statement Exec
 // (requires multiStatements in the DSN; loadSegment ensures it).
-func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64, multiRow int) error {
+func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64, multiRow int, prepared bool) error {
+	if prepared {
+		return insertFilePrepared(db, table, file, cols, batchRows, doneRows)
+	}
 	if multiRow > 0 {
 		return insertFileMultiRow(db, table, file, cols, batchRows, doneRows, multiRow)
 	}
@@ -243,6 +248,99 @@ func insertFile(db *sql.DB, table, file string, cols []string, batchRows int, do
 		}
 	}
 	return flush()
+}
+
+// insertFilePrepared prepares one statement template per distinct column
+// signature (requires gen --fill-buckets so signatures repeat) and executes
+// row by row, skipping per-row parse/prepare on the server.
+func insertFilePrepared(db *sql.DB, table, file string, cols []string, batchRows int, doneRows *int64) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(bufio.NewReaderSize(f, 4*1024*1024))
+	r.ReuseRecord = false
+
+	ctx := context.Background()
+	// The bulk-load session lives on the connection; pin everything to one conn.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	type tmpl struct {
+		stmt *sql.Stmt
+	}
+	tmpls := map[string]*tmpl{}
+	defer func() {
+		for _, t := range tmpls {
+			t.stmt.Close()
+		}
+	}()
+
+	beginTxn := func() error { _, err := conn.ExecContext(ctx, "BEGIN"); return err }
+	commitTxn := func() error { _, err := conn.ExecContext(ctx, "COMMIT"); return err }
+
+	if err := beginTxn(); err != nil {
+		return err
+	}
+	n := 0
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		var names []string
+		var vals []any
+		for i, v := range rec {
+			if v == `\N` {
+				continue
+			}
+			names = append(names, cols[i])
+			vals = append(vals, v)
+		}
+		sig := strings.Join(names, ",")
+		t := tmpls[sig]
+		if t == nil {
+			ph := make([]string, len(names))
+			for i := range ph {
+				ph[i] = "?"
+			}
+			stmt, err := conn.PrepareContext(ctx, "INSERT INTO "+table+" ("+sig+") VALUES ("+strings.Join(ph, ",")+")")
+			if err != nil {
+				return err
+			}
+			t = &tmpl{stmt: stmt}
+			tmpls[sig] = t
+		}
+		if _, err := t.stmt.ExecContext(ctx, vals...); err != nil {
+			return err
+		}
+		n++
+		if n >= batchRows {
+			if err := commitTxn(); err != nil {
+				return err
+			}
+			atomic.AddInt64(doneRows, int64(n))
+			n = 0
+			if err := beginTxn(); err != nil {
+				return err
+			}
+		}
+	}
+	if n > 0 {
+		if err := commitTxn(); err != nil {
+			return err
+		}
+		atomic.AddInt64(doneRows, int64(n))
+	}
+	return nil
 }
 
 // insertFileMultiRow groups rows sharing the same non-null column set into
