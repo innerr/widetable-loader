@@ -33,3 +33,16 @@ func (l MulHash) ID(seq uint64) uint64 { return (seq*mulA + l.C) & positiveMask 
 func NewMulHash(seed uint64) MulHash {
 	return MulHash{C: (seed*mulA + 0x517cc1b727220a95) & positiveMask}
 }
+
+// Hash32Prefix combines a 31-bit hash prefix with the low 32 sequence bits.
+// Keys fit signed BIGINT and are distinct for sequences below 2^32.
+type Hash32Prefix struct{}
+
+func (l Hash32Prefix) ID(seq uint64) uint64 {
+	x := seq
+	// Mix the sequence, then retain 31 hash bits in the positive key.
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x = x ^ (x >> 31)
+	return ((x << 32) | (seq & 0xffffffff)) & positiveMask
+}

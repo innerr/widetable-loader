@@ -4,9 +4,7 @@
 // Three checks, in order:
 //  1. row count: SELECT COUNT(*) vs --total-rows;
 //  2. sampled rows: regenerate sampled rows from --seed and compare the
-//     filled-column set and exact values of string/int/fixed columns
-//     (double/bool/json columns are compared for presence only: their SQL
-//     text representation is not byte-stable);
+//     filled-column set and values, with numeric/JSON normalization;
 //  3. index probe: point-query the first indexed declared column of each
 //     sampled row and require the expected id in the returned set.
 //
@@ -15,15 +13,20 @@ package check
 
 import (
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/innerr/widetable-loader/internal/gen"
+	"github.com/innerr/widetable-loader/internal/sqlutil"
 )
 
 // Run parses flags and verifies the table against regenerated rows.
@@ -37,7 +40,7 @@ func Run(args []string) error {
 	)
 	fs.Uint64Var(&cfg.TotalRows, "total-rows", 0, "total rows across all segments (must match gen)")
 	fs.Uint64Var(&cfg.Segments, "segments", 8, "total segment count (must match gen)")
-	fs.StringVar(&cfg.Scatter, "scatter", "blocked", "key layout (must match gen)")
+	fs.StringVar(&cfg.Scatter, "scatter", "hash32", "key layout (must match gen)")
 	fs.Uint64Var(&cfg.GapFactor, "gap-factor", 10, "blocked gap factor (must match gen)")
 	fs.Uint64Var(&cfg.Seed, "seed", 1, "random seed (must match gen)")
 	fs.IntVar(&cfg.Fields, "fields", 5000, "declared column count (must match gen)")
@@ -46,6 +49,7 @@ func Run(args []string) error {
 	fs.IntVar(&cfg.IndexFields, "index-fields", 15, "indexed declared columns (must match gen)")
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (must match gen)")
 	fs.IntVar(&cfg.RowWidth, "row-width", 1024, "target row width (must match gen)")
+	fs.IntVar(&cfg.FillBuckets, "fill-buckets", 0, "column sets (must match gen)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -54,6 +58,12 @@ func Run(args []string) error {
 	}
 	if cfg.FileCols == 0 {
 		cfg.FileCols = cfg.Fields
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if *sampleK < 1 {
+		return fmt.Errorf("sample-per-segment must be positive")
 	}
 
 	db, err := sql.Open("mysql", *dsn)
@@ -66,7 +76,7 @@ func Run(args []string) error {
 
 	// 1. Row count.
 	var cnt uint64
-	if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`", *table)).Scan(&cnt); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM " + sqlutil.QuoteIdentifier(*table)).Scan(&cnt); err != nil {
 		return fmt.Errorf("count query: %w", err)
 	}
 	if cnt != cfg.TotalRows {
@@ -147,14 +157,14 @@ func Run(args []string) error {
 // record layout: [id, f1..fF, c000001..cFileCols].
 func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Config, rec []string) bool {
 	id := rec[0]
-	rows, err := db.Query(fmt.Sprintf("SELECT %s FROM `%s` WHERE id = %s", colList, table, id))
+	rows, err := db.Query(fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", colList, sqlutil.QuoteIdentifier(table)), id)
 	if err != nil {
 		fmt.Printf("FAIL id %s: query: %v\n", id, err)
 		return false
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		fmt.Printf("FAIL id %s: row missing\n", id)
+		fmt.Printf("FAIL id %s: row missing or query failed: %v\n", id, rows.Err())
 		return false
 	}
 	vals := make([]sql.NullString, len(colNames))
@@ -174,15 +184,15 @@ func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Conf
 		if vals[i].Valid {
 			got = vals[i].String
 		}
-		if (want == "") != (got == "") {
-			fmt.Printf("FAIL id %s col %s: presence mismatch (want filled=%v, got filled=%v)\n", id, name, want != "", got != "")
+		if (want != "") != vals[i].Valid {
+			fmt.Printf("FAIL id %s col %s: presence mismatch (want filled=%v, got filled=%v)\n", id, name, want != "", vals[i].Valid)
 			ok = false
 			continue
 		}
 		if want == "" {
 			continue
 		}
-		if exactCompare(name, i, cfg) && want != got {
+		if !equalValue(i, cfg, want, got) {
 			fmt.Printf("FAIL id %s col %s: value mismatch (want %.40q, got %.40q)\n", id, name, want, got)
 			ok = false
 		}
@@ -190,15 +200,21 @@ func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Conf
 	return ok
 }
 
-// exactCompare reports whether the column value is byte-stable through SQL.
-// Fixed columns and int/string declared columns are exact; double/bool/json
-// representations are not (compared for presence only).
-func exactCompare(name string, idx int, cfg gen.Config) bool {
+func equalValue(idx int, cfg gen.Config, want, got string) bool {
 	if idx <= cfg.FixedCols {
-		return true // id and fixed columns
+		return want == got
 	}
-	declaredIdx := idx - 1 - cfg.FixedCols // 0-based declared column index
-	return declaredIdx%5 == 0 || declaredIdx%5 == 1 // int or string
+	switch (idx - 1 - cfg.FixedCols) % 5 {
+	case 2:
+		a, errA := strconv.ParseFloat(want, 64)
+		b, errB := strconv.ParseFloat(got, 64)
+		return errA == nil && errB == nil && math.Abs(a-b) <= 1e-12*math.Max(1, math.Abs(a))
+	case 4:
+		var a, b any
+		return json.Unmarshal([]byte(want), &a) == nil && json.Unmarshal([]byte(got), &b) == nil && reflect.DeepEqual(a, b)
+	default:
+		return want == got
+	}
 }
 
 // probeIndex point-queries the first indexed declared column and requires
@@ -207,7 +223,7 @@ func probeIndex(db *sql.DB, table string, cfg gen.Config, rec []string) bool {
 	idx := 1 + cfg.FixedCols // record index of c000001
 	val := rec[idx]
 	id := rec[0]
-	rows, err := db.Query(fmt.Sprintf("SELECT id FROM `%s` WHERE c000001 = '%s'", table, val))
+	rows, err := db.Query("SELECT id FROM "+sqlutil.QuoteIdentifier(table)+" WHERE c000001 = ?", val)
 	if err != nil {
 		fmt.Printf("FAIL index probe id %s: query: %v\n", id, err)
 		return false
@@ -223,6 +239,10 @@ func probeIndex(db *sql.DB, table string, cfg gen.Config, rec []string) bool {
 		if got == id {
 			found = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Printf("FAIL index probe id %s: %v\n", id, err)
+		return false
 	}
 	if !found {
 		fmt.Printf("FAIL index probe id %s: c000001=%.40q does not reach the row\n", id, val)
