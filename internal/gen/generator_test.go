@@ -196,3 +196,55 @@ func TestInvalidDimensions(t *testing.T) {
 		t.Fatal("zero-fill rows must be supported:", err)
 	}
 }
+
+func TestIndexColsExplicit(t *testing.T) {
+	cfg := Config{TotalRows: 8, Segments: 1, Scatter: "none", Fields: 10, Fill: 4,
+		IndexCols: []int{1, 7}, IndexFields: 2, RowWidth: 32, Seed: 5}
+	g, err := NewGenerator(cfg, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for seq := uint64(0); seq < 8; seq++ {
+		rec, err := g.Next(seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range []int{1, 7} {
+			if rec[1+c] == "" {
+				t.Fatalf("index column %d empty at row %d", c, seq)
+			}
+		}
+	}
+}
+
+func TestIndexColsValidation(t *testing.T) {
+	cases := []Config{
+		{TotalRows: 8, Segments: 1, Scatter: "none", Fields: 5, Fill: 2, IndexCols: []int{5}},
+		{TotalRows: 8, Segments: 1, Scatter: "none", Fields: 5, Fill: 2, IndexCols: []int{1, 1}},
+		{TotalRows: 8, Segments: 1, Scatter: "none", Fields: 5, Fill: 1, IndexCols: []int{1, 2}},
+	}
+	for _, cfg := range cases {
+		if _, err := NewGenerator(cfg, 0); err == nil {
+			t.Fatalf("expected error for index-cols %v", cfg.IndexCols)
+		}
+	}
+}
+
+func TestParseIndexCols(t *testing.T) {
+	cols, err := parseIndexCols("c000001, c000003,4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{0, 2, 3}
+	if len(cols) != len(want) {
+		t.Fatalf("got %v want %v", cols, want)
+	}
+	for i := range want {
+		if cols[i] != want[i] {
+			t.Fatalf("got %v want %v", cols, want)
+		}
+	}
+	if _, err := parseIndexCols("c0,abc"); err == nil {
+		t.Fatal("expected error for invalid column")
+	}
+}

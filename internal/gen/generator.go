@@ -36,6 +36,7 @@ type Config struct {
 	FileCols    int
 	FixedCols   int
 	IndexFields int
+	IndexCols   []int // explicit declared-column indexes (0-based); overrides IndexFields
 	Fill        int
 	RowWidth    int
 	FillBuckets int // >0: cycle through this many pre-picked column sets instead of per-row random
@@ -109,20 +110,23 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Index columns must carry an indexable rotated type (int at col%5==0,
-	// double at col%5==2). Wide-table secondary indexes only accept
-	// INT/DOUBLE/short VARCHAR columns, so text (1), bool (3) and json (4)
+	// An explicit index-cols list names the columns that carry secondary
+	// indexes. Without it, index columns must carry an indexable rotated type
+	// (int at col%5==0, double at col%5==2): wide-table secondary indexes only
+	// accept INT/DOUBLE/short VARCHAR, so text (1), bool (3) and json (4)
 	// rotations are skipped when picking the first IndexFields columns.
-	indexCols := make([]int, 0, cfg.IndexFields)
-	for c := 0; c < cfg.FileCols && len(indexCols) < cfg.IndexFields; c++ {
-		if c%5 == 0 || c%5 == 2 {
-			indexCols = append(indexCols, c)
+	indexCols := append([]int(nil), cfg.IndexCols...)
+	if len(indexCols) == 0 {
+		for c := 0; c < cfg.FileCols && len(indexCols) < cfg.IndexFields; c++ {
+			if c%5 == 0 || c%5 == 2 {
+				indexCols = append(indexCols, c)
+			}
+		}
+		if len(indexCols) < cfg.IndexFields {
+			return nil, fmt.Errorf("not enough indexable columns (int/double rotations) for index-fields=%d", cfg.IndexFields)
 		}
 	}
-	if len(indexCols) < cfg.IndexFields {
-		return nil, fmt.Errorf("not enough indexable columns (int/double rotations) for index-fields=%d", cfg.IndexFields)
-	}
-	isIndex := make(map[int]bool, cfg.IndexFields)
+	isIndex := make(map[int]bool, len(indexCols))
 	for _, c := range indexCols {
 		isIndex[c] = true
 	}
@@ -131,7 +135,7 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 		layout:    layout,
 		rng:       rand.New(rand.NewSource(int64(cfg.Seed*1000003 + segment))),
 		indexCols: indexCols,
-		perm:      make([]int, cfg.FileCols-cfg.IndexFields),
+		perm:      make([]int, cfg.FileCols-len(indexCols)),
 		record:    make([]string, 1+cfg.FixedCols+cfg.FileCols),
 		row0:      segment * cfg.RowsPerSeg(),
 	}
@@ -171,6 +175,19 @@ func (this Config) Validate() error {
 	}
 	if this.IndexFields > this.Fill || this.Fill > fileCols || fileCols > this.Fields {
 		return fmt.Errorf("require index-fields <= fill <= file-cols <= fields")
+	}
+	seen := make(map[int]bool, len(this.IndexCols))
+	for _, c := range this.IndexCols {
+		if c < 0 || c >= fileCols {
+			return fmt.Errorf("index-cols entry %d outside 0..%d", c, fileCols-1)
+		}
+		if seen[c] {
+			return fmt.Errorf("index-cols contains duplicate column %d", c)
+		}
+		seen[c] = true
+	}
+	if len(this.IndexCols) > this.Fill {
+		return fmt.Errorf("require len(index-cols) <= fill")
 	}
 	const maxID = uint64(1<<63 - 1)
 	if this.TotalRows > maxID {
@@ -215,8 +232,8 @@ func (g *Generator) Next(seq uint64) ([]string, error) {
 	for _, c := range g.indexCols {
 		g.record[1+cfg.FixedCols+c] = value(c, seq, g.strLen, g.rng)
 	}
-	// The rest: partial Fisher-Yates to pick fill-indexFields columns.
-	need := cfg.Fill - cfg.IndexFields
+	// The rest: partial Fisher-Yates to pick fill-len(indexCols) columns.
+	need := cfg.Fill - len(g.indexCols)
 	if cfg.FillBuckets > 0 {
 		if len(g.buckets) == 0 {
 			// Pre-pick FillBuckets column sets once (deterministic from rng).
