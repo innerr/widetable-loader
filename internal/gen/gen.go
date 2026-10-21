@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -21,6 +22,7 @@ func Run(args []string) error {
 		sqlTable    = fs.String("sql-table", "", "sql format: target table name for INSERT statements")
 		sqlMultiRow = fs.Int("sql-multi-row", 1, "sql format: rows per INSERT statement (groups break earlier when the filled-column set changes)")
 		sqlUpsert   = fs.Bool("sql-upsert", false, "sql format: append ON DUPLICATE KEY UPDATE")
+		indexCols   = fs.String("index-cols", "", "comma-separated declared columns carrying secondary indexes, e.g. c000001,c000003; overrides -index-fields")
 	)
 	fs.Uint64Var(&cfg.TotalRows, "total-rows", 0, "total rows across all segments")
 	fs.Uint64Var(&cfg.Segments, "segments", 8, "total segment count")
@@ -52,6 +54,14 @@ func Run(args []string) error {
 	}
 	if *sqlMultiRow < 1 {
 		return fmt.Errorf("--sql-multi-row must be >= 1")
+	}
+	if *indexCols != "" {
+		cols, err := parseIndexCols(*indexCols)
+		if err != nil {
+			return err
+		}
+		cfg.IndexCols = cols
+		cfg.IndexFields = len(cols)
 	}
 
 	g, err := NewGenerator(cfg, *segment)
@@ -166,4 +176,26 @@ func writeRecord(buf *bufio.Writer, record []string) {
 		buf.WriteByte('"')
 	}
 	buf.WriteByte('\n')
+}
+
+// parseIndexCols reads a comma-separated list of declared column names (c000001)
+// or column numbers into 0-based column indexes.
+func parseIndexCols(raw string) ([]int, error) {
+	cols := make([]int, 0, 8)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		digits := strings.TrimLeft(part, "cC")
+		n, err := strconv.Atoi(digits)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("index-cols entry %q is not a positive column number", part)
+		}
+		cols = append(cols, n-1)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("index-cols is empty")
+	}
+	return cols, nil
 }
