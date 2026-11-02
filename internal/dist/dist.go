@@ -295,21 +295,22 @@ func Run(args []string) error {
 func runGen(args []string) (err error) {
 	fs := flag.NewFlagSet("dist gen", flag.ContinueOnError)
 	var (
-		nodesSpec   = fs.String("nodes", "", `comma list "host:daemon_port[:sql_port]"`)
-		segments    = fs.Uint64("segments", 0, "total segment count across all nodes")
-		totalRows   = fs.Uint64("total-rows", 0, "total rows across all segments")
-		outDir      = fs.String("out-dir", "", "segment output directory (same local path on every node)")
-		scatter     = fs.String("scatter", "hash32", "key layout: hash32 (customer scatter, default) | keyseq (key-ordered segments with disjoint ranges) | blocked | none | mul-hash")
-		gapFactor   = fs.Uint64("gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor")
-		seed        = fs.Uint64("seed", 1, "random seed (identical data for same seed/params)")
-		fields      = fs.Int("fields", 5000, "declared column count")
-		fileCols    = fs.Int("file-cols", 0, "declared columns in file (default = fields)")
-		fixedCols   = fs.Int("fixed-cols", 6, "fixed column count (always filled)")
-		indexFlds   = fs.Int("index-fields", 15, "indexed declared columns (filled every row)")
-		fill        = fs.Int("fill", 100, "filled declared columns per row")
-		rowWidth    = fs.Int("row-width", 1024, "target row width in bytes")
-		fillBuckets = fs.Int("fill-buckets", 0, ">0: cycle N pre-picked column sets")
-		writeHash   = fs.Bool("write-hash-sidecar", false, "write each segment's content hash next to it, so a later import can skip hashing the dataset")
+		nodesSpec    = fs.String("nodes", "", `comma list "host:daemon_port[:sql_port]"`)
+		segments     = fs.Uint64("segments", 0, "total segment count across all nodes")
+		totalRows    = fs.Uint64("total-rows", 0, "total rows across all segments")
+		outDir       = fs.String("out-dir", "", "segment output directory (same local path on every node)")
+		scatter      = fs.String("scatter", "hash32", "key layout: hash32 (customer scatter, default) | keyseq (key-ordered segments with disjoint ranges) | blocked | none | mul-hash")
+		gapFactor    = fs.Uint64("gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor")
+		seed         = fs.Uint64("seed", 1, "random seed (identical data for same seed/params)")
+		fields       = fs.Int("fields", 5000, "declared column count")
+		fileCols     = fs.Int("file-cols", 0, "declared columns in file (default = fields)")
+		fixedCols    = fs.Int("fixed-cols", 6, "fixed column count (always filled)")
+		indexFlds    = fs.Int("index-fields", 15, "indexed declared columns (filled every row)")
+		fill         = fs.Int("fill", 100, "filled declared columns per row")
+		rowWidth     = fs.Int("row-width", 1024, "target row width in bytes")
+		fillBuckets  = fs.Int("fill-buckets", 0, ">0: cycle N pre-picked column sets")
+		skipHashFile = fs.Bool("no-hash-file", false,
+			"do not write each segment's content hash next to it; only set this to reproduce rounds measured before hash files existed")
 		format      = fs.String("format", "csv", "output format: csv | sql (pair mode requires sql)")
 		sqlTable    = fs.String("sql-table", "", "sql format: target table name")
 		sqlMultiRow = fs.Int("sql-multi-row", 1, "sql format: rows per INSERT statement")
@@ -338,7 +339,7 @@ func runGen(args []string) (err error) {
 	cfg.Fill = *fill
 	cfg.RowWidth = *rowWidth
 	cfg.FillBuckets = *fillBuckets
-	cfg.WriteHashSidecar = *writeHash
+	cfg.SkipHashFile = *skipHashFile
 	if cfg.PairCatalog > 0 {
 		spec, err := gen.ParsePairRawDist(*pairRawSpec)
 		if err != nil {
@@ -396,29 +397,29 @@ func runGen(args []string) (err error) {
 			defer wg.Done()
 			for seg := info.from; seg < info.to; seg++ {
 				body := map[string]interface{}{
-					"out":                fmt.Sprintf("%s/seg-%d%s", *outDir, seg, segmentExt),
-					"segment":            seg,
-					"segments":           *segments,
-					"total_rows":         *totalRows,
-					"scatter":            *scatter,
-					"gap_factor":         *gapFactor,
-					"seed":               *seed,
-					"fields":             *fields,
-					"file_cols":          *fileCols,
-					"fixed_cols":         *fixedCols,
-					"index_fields":       *indexFlds,
-					"fill":               *fill,
-					"row_width":          *rowWidth,
-					"fill_buckets":       *fillBuckets,
-					"write_hash_sidecar": *writeHash,
-					"format":             *format,
-					"pair_catalog":       cfg.PairCatalog,
-					"pair_fill":          cfg.PairFill,
-					"pair_bucket_rows":   cfg.PairBucketRows,
-					"pair_raw_bytes":     cfg.PairRawDist,
-					"pair_time_start":    cfg.PairTimeStart,
-					"pair_time_span":     cfg.PairTimeSpan,
-					"pair_index":         cfg.PairIndex,
+					"out":              fmt.Sprintf("%s/seg-%d%s", *outDir, seg, segmentExt),
+					"segment":          seg,
+					"segments":         *segments,
+					"total_rows":       *totalRows,
+					"scatter":          *scatter,
+					"gap_factor":       *gapFactor,
+					"seed":             *seed,
+					"fields":           *fields,
+					"file_cols":        *fileCols,
+					"fixed_cols":       *fixedCols,
+					"index_fields":     *indexFlds,
+					"fill":             *fill,
+					"row_width":        *rowWidth,
+					"fill_buckets":     *fillBuckets,
+					"skip_hash_file":   *skipHashFile,
+					"format":           *format,
+					"pair_catalog":     cfg.PairCatalog,
+					"pair_fill":        cfg.PairFill,
+					"pair_bucket_rows": cfg.PairBucketRows,
+					"pair_raw_bytes":   cfg.PairRawDist,
+					"pair_time_start":  cfg.PairTimeStart,
+					"pair_time_span":   cfg.PairTimeSpan,
+					"pair_index":       cfg.PairIndex,
 				}
 				if *format == "sql" {
 					body["sql_table"] = *sqlTable

@@ -16,7 +16,7 @@ import (
 func Run(args []string) error {
 	fs := flag.NewFlagSet("split", flag.ContinueOnError)
 	input := fs.String("in", "", "input CSV (id is the first column)")
-	columns := fs.String("columns", "", "column sidecar (default: <in>.columns)")
+	columns := fs.String("columns", "", "file listing the columns of a csv segment (default: <in>.columns)")
 	out := fs.String("out-dir", "", "new output directory")
 	segments := fs.Int("segments", 8, "number of output segments")
 	if err := fs.Parse(args); err != nil {
@@ -34,7 +34,7 @@ func Run(args []string) error {
 	}
 	names := strings.Fields(string(b))
 	if len(names) == 0 || names[0] != "id" {
-		return errors.New("first sidecar column must be id")
+		return errors.New("first column in the column list must be id")
 	}
 	f, err := os.Open(*input)
 	if err != nil {

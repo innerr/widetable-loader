@@ -28,16 +28,20 @@ Preparation belongs to the preparation phase and is written to disk by `gen`:
 |---|---|---|
 | Generate rows | `gen` | `seg-N.csv` / `seg-N.sql` |
 | Build the INSERT statements (including multi-row grouping) | `gen -format sql -sql-multi-row N` | `seg-N.sql` |
-| Hash the segment contents (so a resumed load can compare them) | `gen --write-hash-sidecar` | `seg-N.hash` |
+| Hash the segment contents (so a resumed load can compare them) | `gen` (on by default) | `seg-N.hash` |
 
 Why the split: preparation counted inside the load wall clock lowers the
 reported throughput and puts the hot spots on the load path, hiding the real
 bottleneck. Hashing the dataset by reading it back, and parsing CSV row by row
 to build statements, each measured as a large share of load time.
 
-Both `gen` switches default to off. With them off `load` hashes the segments
-and builds the statements itself -- the behaviour of the earlier rounds, kept so
-those numbers can be reproduced.
+Hash files are written by default: reading a small file beats re-reading every
+segment before the first row goes in. `-no-hash-file` turns that off, which
+makes `load` hash the segments itself -- the behaviour of the rounds measured
+before hash files existed, kept only so those numbers can be reproduced.
+
+Multi-row grouping is decided at generation time (`-sql-multi-row` together
+with `-fill-buckets`), never during load.
 
 ## Build
 
@@ -69,12 +73,12 @@ done
   --fixed-cols 0 --index-fields 1 --fill 3 --seed 7
 ```
 
-`gen` writes a `.columns` sidecar in file order. Empty generated fields use
+`gen` writes a `.columns` file listing the column names in file order. Empty generated fields use
 `\N` for NULL; imported empty strings remain empty strings. `check` requires
 the same generation parameters, including `scatter`, `file-cols`,
 `fill-buckets`, `row-width`, and `seed`. It is not a checker for arbitrary
 customer files.
-Generation refuses to overwrite existing CSV or sidecar files; use a new
+Generation refuses to overwrite existing CSV files or column lists; use a new
 output path or remove the old pair explicitly.
 
 Key layouts are `hash32` (default, at most 2^32 sequence values), `blocked`,
@@ -103,7 +107,7 @@ The CSV entry requires server-side `local_infile` support and rolls back
 imports that produce warnings.
 
 Each directory is locked during a load. `.load-progress.json` records the
-target, completed files and SHA-256 hashes of the CSV and sidecar. Unfinished
+target, completed files and SHA-256 hashes of the CSV and its column list. Unfinished
 segments are recorded before import and may contain committed batches.
 Completed files are skipped; changed files or a different target are rejected.
 Only non-bulk upsert automatically replays unfinished segments.
@@ -113,7 +117,7 @@ the target table, use `--no-resume` to import every file. For an unfinished
 `insert`, `csv`, or bulk import, verify or clear the target before using it.
 Connection loss during commit is uncertain, not evidence of rollback.
 
-`split --in source.csv --out-dir segments --segments 4` uses the input sidecar
+`split --in source.csv --out-dir segments --segments 4` uses the input column list
 (or `--columns FILE`), rejects duplicate signed BIGINT keys and requires a new
 output directory. Duplicate detection keeps all keys in memory; output opens
 one file per segment.

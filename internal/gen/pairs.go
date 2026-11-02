@@ -40,6 +40,13 @@ type PairIndex struct {
 
 var pairFamilies = [5]string{"ms", "md", "mi", "mb", "ma"}
 
+// Default byte lengths of the random strings in the ms_*_val and ma_*_val
+// columns. They come from the customer row shape and are not sampled.
+const (
+	defaultPairMsBytes = 18
+	defaultPairMaBytes = 24
+)
+
 // pairSystemColumns are written on every row before the field pairs. Spatial
 // columns (gP_Location, gP_TrajectoryPoints) and TTL are out of scope for the
 // pair cases, so they are never generated.
@@ -60,6 +67,8 @@ type pairGen struct {
 	timeSpan   int64
 	rawDist    []PairRaw
 	rawTotal   float64
+	msBytes    int
+	maBytes    int
 	perm       []int
 	buckets    [][]int // FillBuckets > 0: pre-picked column sets cycled per row
 	bucketRows int     // PairBucketRows: consecutive rows per bucket before cycling
@@ -75,6 +84,15 @@ func newPairGen(cfg Config) *pairGen {
 	for i := range perm {
 		perm[i] = i
 	}
+	// Zero means the caller did not set them (no flag given, or a Config built
+	// in a test); fall back to the customer row shape's lengths.
+	msBytes, maBytes := cfg.PairMsBytes, cfg.PairMaBytes
+	if msBytes <= 0 {
+		msBytes = defaultPairMsBytes
+	}
+	if maBytes <= 0 {
+		maBytes = defaultPairMaBytes
+	}
 	p := &pairGen{
 		perFamily:  cfg.PairCatalog / len(pairFamilies),
 		index:      cfg.PairIndex,
@@ -82,6 +100,8 @@ func newPairGen(cfg Config) *pairGen {
 		timeSpan:   cfg.PairTimeSpan,
 		rawDist:    cfg.PairRawDist,
 		rawTotal:   total,
+		msBytes:    msBytes,
+		maBytes:    maBytes,
 		perm:       perm,
 		bucketRows: cfg.PairBucketRows,
 		rng:        rand.New(rand.NewSource(int64(cfg.Seed*7919 + 17))),
@@ -123,6 +143,10 @@ func validatePairConfig(cfg Config) error {
 	}
 	if cfg.PairTimeSpan <= 0 {
 		return fmt.Errorf("pair-time-span must be positive")
+	}
+	// Negative lengths are invalid; zero means "use the default".
+	if cfg.PairMsBytes < 0 || cfg.PairMaBytes < 0 {
+		return fmt.Errorf("pair-ms-bytes and pair-ma-bytes must be nonnegative")
 	}
 	for name, value := range map[string]int{
 		"pair-dw-distinct":           cfg.PairIndex.DWDistinct,
@@ -195,10 +219,10 @@ func (p *pairGen) value(family string) (string, string) {
 		}
 		return "false", "false"
 	case "ma":
-		s := randString(24, p.rng)
+		s := randString(p.maBytes, p.rng)
 		return quoteJSON(s), "'" + s + "'"
 	default: // ms
-		s := randString(18, p.rng)
+		s := randString(p.msBytes, p.rng)
 		return quoteJSON(s), "'" + s + "'"
 	}
 }
@@ -492,6 +516,10 @@ func RegisterPairFlags(fs *flag.FlagSet, cfg *Config) *string {
 		"pair mode: createTime base in milliseconds")
 	fs.Int64Var(&cfg.PairTimeSpan, "pair-time-span", 259200000,
 		"pair mode: createTime span in milliseconds")
+	fs.IntVar(&cfg.PairMsBytes, "pair-ms-bytes", defaultPairMsBytes,
+		"pair mode: byte length of the random string in ms_*_val columns")
+	fs.IntVar(&cfg.PairMaBytes, "pair-ma-bytes", defaultPairMaBytes,
+		"pair mode: byte length of the random string in ma_*_val columns")
 	fs.IntVar(&cfg.PairIndex.DWDistinct, "pair-dw-distinct", 100, "pair mode: distinct dwId values")
 	fs.IntVar(&cfg.PairIndex.RowsPerPgID, "pair-rows-per-pg-id", 250, "pair mode: rows per pgId")
 	fs.IntVar(&cfg.PairIndex.RowsPerOssPath, "pair-rows-per-oss-path", 4, "pair mode: rows per ossPath")

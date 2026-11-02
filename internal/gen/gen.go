@@ -33,8 +33,9 @@ func Run(args []string) error {
 		sqlUpsert   = fs.Bool("sql-upsert", false, "sql format: append ON DUPLICATE KEY UPDATE")
 		indexCols   = fs.String("index-cols", "", "comma-separated declared columns carrying secondary indexes, e.g. c000001,c000003; overrides -index-fields")
 	)
-	fs.BoolVar(&cfg.WriteHashSidecar, "write-hash-sidecar", false,
-		"write each segment's content hash next to it, so a later import can skip hashing the dataset; off by default (matches earlier rounds)")
+	fs.BoolVar(&cfg.SkipHashFile, "no-hash-file", false,
+		"do not write each segment's content hash next to it; the import then hashes every segment itself before the first row. "+
+			"Off by default: the hash file removes a full read of the dataset. Only set this to reproduce rounds measured before hash files existed")
 	fs.Uint64Var(&cfg.TotalRows, "total-rows", 0, "total rows across all segments")
 	fs.Uint64Var(&cfg.Segments, "segments", 8, "total segment count")
 	fs.StringVar(&cfg.Scatter, "scatter", "hash32", "key layout: hash32 (customer scatter, default) | keyseq (key-ordered segments with disjoint ranges) | blocked | none | mul-hash")
@@ -152,7 +153,7 @@ func Run(args []string) error {
 		if err := f.Close(); err != nil {
 			return err
 		}
-		return publishSegment(f.Name(), *out, !sql, cfg.WriteHashSidecar)
+		return publishSegment(f.Name(), *out, !sql, !cfg.SkipHashFile)
 	}
 	if sql {
 		if cfg.PairCatalog > 0 {
@@ -168,11 +169,11 @@ func Run(args []string) error {
 }
 
 // publishSegment never overwrites data or the column list from an earlier
-// run; the column sidecar is only linked for csv segments (sql statements
+// run; the column list file is only linked for csv segments (sql statements
 // carry their own column lists). With writeHash it also writes the segment's
 // content hash next to it, so a later import can read the hash instead of
-// hashing the segment (and its column sidecar) again before the first row is
-// written; this is off by default.
+// hashing the segment (and its column list) again before the first row is
+// written. writeHash is on unless -no-hash-file was given.
 func publishSegment(stage, out string, columns bool, writeHash bool) error {
 	if columns {
 		if err := os.Link(stage+".columns", out+".columns"); err != nil {
@@ -186,7 +187,7 @@ func publishSegment(stage, out string, columns bool, writeHash bool) error {
 	if !writeHash {
 		return nil
 	}
-	if err := WriteHashSidecar(out, columns); err != nil {
+	if err := WriteHashFile(out, columns); err != nil {
 		os.Remove(out)
 		if columns {
 			os.Remove(out + ".columns")
