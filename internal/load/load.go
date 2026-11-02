@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/innerr/widetable-loader/internal/gen"
+
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/innerr/widetable-loader/internal/sqlutil"
@@ -41,6 +43,7 @@ type Params struct {
 	AllowSK   bool   `json:"allow_sk"`
 	Unsorted  bool   `json:"allow_unsorted"`
 	NoResume  bool   `json:"no_resume"`
+	SkipHash  bool   `json:"skip_hash"`
 }
 
 type Progress struct {
@@ -62,8 +65,8 @@ func (this Params) Validate() error {
 	if this.Entry != "csv" && this.Entry != "insert" && this.Entry != "upsert" {
 		return fmt.Errorf("unknown entry %q (csv | insert | upsert)", this.Entry)
 	}
-	if this.Prepared && this.MultiRow > 0 {
-		return errors.New("prepared and multi-row cannot be combined")
+	if this.Prepared && this.MultiRow > 0 && this.Entry != "insert" {
+		return errors.New("prepared with multi-row is only supported on the insert entry")
 	}
 	if this.Entry == "csv" && (this.Prepared || this.MultiRow > 0) {
 		return errors.New("csv entry does not accept prepared or multi-row")
@@ -87,6 +90,7 @@ func Run(args []string) error {
 	fs.BoolVar(&p.AllowSK, "allow-sk", false, "bulk: allow secondary keys")
 	fs.BoolVar(&p.Unsorted, "allow-unsorted", false, "bulk: unordered input")
 	fs.BoolVar(&p.NoResume, "no-resume", false, "ignore previous completion records and load every file")
+	fs.BoolVar(&p.SkipHash, "skip-hash", false, "identify segments by size and mtime instead of hashing their content")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -132,6 +136,15 @@ func RunWithProgress(ctx context.Context, p Params, onProgress func(Progress)) e
 		if extra, _ := filepath.Glob(filepath.Join(p.Dir, "*.sql")); len(extra) > 0 {
 			return fmt.Errorf("mixed csv and sql segments in %s; use one format per directory", p.Dir)
 		}
+	}
+	// Pre-rendered .sql segments are replayed one statement per line, so the
+	// column-list grouping that --multi-row drives never runs. The flag used to
+	// be ignored here without a word (the 2026-10-26 定稿轮 was measured with
+	// --multi-row 50 on .sql segments and grouped nothing).
+	if sqlSegments && p.MultiRow > 0 {
+		return fmt.Errorf("--multi-row %d has no effect on .sql segments in %s: each line is replayed as one complete statement, "+
+			"so grouping has to be done when the dataset is generated; drop --multi-row or point at csv segments",
+			p.MultiRow, p.Dir)
 	}
 	sort.Strings(files)
 	lock, err := os.OpenFile(filepath.Join(p.Dir, ".load.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -186,21 +199,50 @@ func RunWithProgress(ctx context.Context, p Params, onProgress func(Progress)) e
 	type segment struct{ file, hash string }
 	queue := make(chan segment, len(files))
 	var rows, segs int64
-	for _, file := range files {
+	// Hash the segments in parallel: on a 100M-row dataset the serial hash pass
+	// reads ~360 GB per node before the first row is written.
+	type hashedSegment struct {
+		file, hash string
+		err        error
+	}
+	hashed := make([]hashedSegment, len(files))
+	var hashWG sync.WaitGroup
+	sem := make(chan struct{}, 16)
+	for i, file := range files {
+		hashWG.Add(1)
+		go func(i int, file string) {
+			defer hashWG.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			hash := ""
+			var err error
+			if p.SkipHash {
+				hash, err = fastHash(file)
+			} else {
+				// Generation writes the hash next to the segment; reading it
+				// avoids re-reading the whole dataset before the first row.
+				hash, err = gen.ReadHashSidecar(file)
+				if err == nil && hash == "" {
+					hash, err = fileHash(file)
+					if err == nil && !sqlSegments {
+						var sidecar string
+						sidecar, err = fileHash(file + ".columns")
+						hash += sidecar
+					}
+				}
+			}
+			hashed[i] = hashedSegment{file: file, hash: hash, err: err}
+		}(i, file)
+	}
+	hashWG.Wait()
+	for _, item := range hashed {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		hash, err := fileHash(file)
-		if err != nil {
-			return err
+		if item.err != nil {
+			return item.err
 		}
-		if !sqlSegments {
-			sidecar, err := fileHash(file + ".columns")
-			if err != nil {
-				return err
-			}
-			hash += sidecar
-		}
+		file, hash := item.file, item.hash
 		if previous, ok := state.Inflight[filepath.Base(file)]; ok && previous != hash {
 			return fmt.Errorf("unfinished file changed: %s; verify the target before --no-resume", file)
 		}
@@ -321,6 +363,17 @@ func fileHash(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// fastHash identifies a segment by size and modification time. It is used when
+// the caller owns the segment directory and no longer needs the cost of hashing
+// hundreds of gigabytes before every resumed run.
+func fastHash(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d-%d", info.Size(), info.ModTime().UnixNano()), nil
 }
 
 func quoteIdentifier(name string) string {

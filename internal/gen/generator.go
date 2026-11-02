@@ -40,6 +40,22 @@ type Config struct {
 	Fill        int
 	RowWidth    int
 	FillBuckets int // >0: cycle through this many pre-picked column sets instead of per-row random
+
+	// Pair mode (customer field pairs). PairCatalog > 0 switches the row model
+	// to sparse field pairs; see pairs.go.
+	PairCatalog    int
+	PairFill       int
+	PairBucketRows int // pair mode: rows per bucket before cycling to the next column set (>1 enables CSV multi-row grouping)
+	PairRawDist    []PairRaw
+	PairTimeStart  int64
+	PairTimeSpan   int64
+	PairIndex      PairIndex
+
+	// WriteHashSidecar is off by default: generation stays exactly as it was
+	// and the import hashes the segments itself, which is what earlier
+	// measured rounds did. Turning it on writes each segment's hash next to
+	// it, so an import can skip that pass.
+	WriteHashSidecar bool
 }
 
 // RowsPerSeg is the fixed row count of every segment.
@@ -59,10 +75,12 @@ func (c Config) layout(segment uint64) (genkey.Layout, error) {
 		return genkey.Identity{Base: segment * (c.Stride() - c.RowsPerSeg())}, nil
 	case "mul-hash":
 		return genkey.NewMulHash(c.Seed), nil
-	case "hash32":
+	case "hash32", "keyseq":
+		// keyseq uses the same id formula as hash32; only the segment membership
+		// and row order differ (key-ordered instead of sequence-ordered).
 		return genkey.Hash32Prefix{}, nil
 	}
-	return nil, fmt.Errorf("unknown scatter %q (blocked | none | mul-hash | hash32)", c.Scatter)
+	return nil, fmt.Errorf("unknown scatter %q (blocked | none | mul-hash | hash32 | keyseq)", c.Scatter)
 }
 
 // Layout exposes the key layout of one segment (bench uses it to derive
@@ -83,11 +101,19 @@ type Generator struct {
 	indexCols []int // file columns carrying secondary indexes (int/double rotations)
 	perm      []int
 	record    []string
-	buckets   [][]int // FillBuckets pre-picked column sets (nil when off)
-	rowIdx    uint64  // row counter for bucket cycling
-	row0      uint64  // first global sequence of the segment
-	row1      uint64  // one past the last
-	pending   uint64  // next seq to emit
+	buckets   [][]int        // FillBuckets pre-picked column sets (nil when off)
+	rowIdx    uint64         // row counter for bucket cycling
+	row0      uint64         // first global sequence of the segment
+	row1      uint64         // one past the last
+	pending   uint64         // next seq to emit
+	keySeq    *genkey.KeySeq // keyseq mode: global key ordering (nil otherwise)
+	rank0     uint64         // keyseq mode: rank range [rank0, rank1) of this segment
+	rank1     uint64
+	nextRank  uint64
+	pair      *pairGen
+	pairFrame []string
+	pairCols  []string
+	pairVals  []string
 }
 
 func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
@@ -141,6 +167,17 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 	}
 	g.row1 = g.row0 + cfg.RowsPerSeg()
 	g.pending = g.row0
+	if cfg.Scatter == "keyseq" {
+		// keyseq segments hold a consecutive run of the global key order, not a
+		// sequence range; the linear-range guards are disabled by opening the
+		// sequence window to the whole domain, and ordering is enforced by rank.
+		g.keySeq = genkey.SharedKeySeq(cfg.TotalRows)
+		g.rank0 = segment * cfg.RowsPerSeg()
+		g.rank1 = g.rank0 + cfg.RowsPerSeg()
+		g.nextRank = g.rank0
+		g.row0, g.row1 = 0, cfg.TotalRows
+		g.pending = g.keySeq.SeqAt(g.rank0)
+	}
 	// Long values are carried by string/json columns only (2 of 5 rotated
 	// types), so spread the target width over them, not over all filled
 	// columns.
@@ -157,11 +194,21 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 		g.perm[i] = c
 		i++
 	}
+	if cfg.PairCatalog > 0 {
+		g.pair = newPairGen(cfg)
+		g.pairCols = make([]string, 0, 1+len(pairSystemColumns)+len(pairIndexColumns)+2*cfg.PairFill)
+		g.pairVals = make([]string, 0, cap(g.pairCols))
+	}
 	return g, nil
 }
 
 // Validate checks the sequence domain and dimensions before allocation.
 func (this Config) Validate() error {
+	if this.PairCatalog > 0 {
+		if err := validatePairConfig(this); err != nil {
+			return err
+		}
+	}
 	if this.Segments == 0 || this.TotalRows == 0 || this.TotalRows%this.Segments != 0 {
 		return fmt.Errorf("total-rows must be positive and divisible by positive segments")
 	}
@@ -194,9 +241,9 @@ func (this Config) Validate() error {
 		return fmt.Errorf("total-rows exceeds signed BIGINT range")
 	}
 	switch this.Scatter {
-	case "hash32":
+	case "hash32", "keyseq":
 		if this.TotalRows > 1<<32 {
-			return fmt.Errorf("hash32 supports at most 2^32 rows")
+			return fmt.Errorf("hash32-based layouts support at most 2^32 rows")
 		}
 	case "blocked":
 		if this.GapFactor == 0 || this.TotalRows > maxID/this.GapFactor {
@@ -210,16 +257,29 @@ func (this Config) Validate() error {
 }
 
 // Next renders the row with global sequence seq, advancing the rng.
-// seq must equal the pending sequence (rows are strictly sequential).
+// seq must be the next row of the segment in output order (sequence order for
+// linear layouts, key order for keyseq); the rng state advances with every
+// row, so skipping ahead means calling Next and discarding the result.
 // The returned slice is reused by the next call.
 func (g *Generator) Next(seq uint64) ([]string, error) {
-	if seq != g.pending {
-		return nil, fmt.Errorf("Next called out of order: want %d, got %d", g.pending, seq)
+	if g.keySeq != nil {
+		if g.nextRank >= g.rank1 {
+			return nil, fmt.Errorf("segment exhausted after %d rows", g.rank1-g.rank0)
+		}
+		if want := g.keySeq.SeqAt(g.nextRank); seq != want {
+			return nil, fmt.Errorf("Next called out of key order: want seq %d (rank %d), got %d", want, g.nextRank, seq)
+		}
+		g.nextRank++
+		g.pending = seq
+	} else {
+		if seq != g.pending {
+			return nil, fmt.Errorf("Next called out of order: want %d, got %d", g.pending, seq)
+		}
+		if seq >= g.row1 {
+			return nil, fmt.Errorf("seq %d past segment end %d", seq, g.row1)
+		}
+		g.pending++
 	}
-	if seq >= g.row1 {
-		return nil, fmt.Errorf("seq %d past segment end %d", seq, g.row1)
-	}
-	g.pending++
 	cfg := g.cfg
 	for i := range g.record {
 		g.record[i] = ""
@@ -263,6 +323,45 @@ func (g *Generator) Next(seq uint64) ([]string, error) {
 		g.record[1+cfg.FixedCols+g.perm[i]] = value(g.perm[i], seq, g.strLen, g.rng)
 	}
 	return g.record, nil
+}
+
+// forEachSeq iterates the segment's rows in output order: key order for
+// keyseq, sequence order for the linear layouts. Every writer below draws
+// its row sequence from here, so keyseq rows reach the output (and the bulk
+// stream) already sorted by primary key.
+func (g *Generator) forEachSeq(ctx context.Context, fn func(seq uint64) error) error {
+	if g.keySeq != nil {
+		for rank := g.rank0; rank < g.rank1; rank++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := fn(g.keySeq.SeqAt(rank)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for seq := g.row0; seq < g.row1; seq++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(seq); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SegKeyBounds reports the [min, max] primary-key range this segment covers.
+// For keyseq this is the exact ingest range of the segment's SST; for the
+// monotonic layouts (blocked/none) it is the sequence-range bounds; for the
+// scattering layouts it is only the min/max of the segment's keys, which do
+// not form a contiguous range.
+func (g *Generator) SegKeyBounds() (uint64, uint64) {
+	if g.keySeq != nil {
+		return g.keySeq.SegmentBounds(g.rank0/g.cfg.RowsPerSeg(), g.cfg.RowsPerSeg())
+	}
+	return g.layout.ID(g.row0), g.layout.ID(g.row1 - 1)
 }
 
 // ColumnNames returns the file/header column order (id, fixed, declared set in the file).
@@ -391,10 +490,7 @@ func (g *Generator) WriteSQLContext(ctx context.Context, w *bufio.Writer, table 
 		group = group[:0]
 		return nil
 	}
-	for seq := g.row0; seq < g.row1; seq++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	if err := g.forEachSeq(ctx, func(seq uint64) error {
 		rec, err := g.Next(seq)
 		if err != nil {
 			return err
@@ -415,6 +511,9 @@ func (g *Generator) WriteSQLContext(ctx context.Context, w *bufio.Writer, table 
 		dup := make([]string, len(rec))
 		copy(dup, rec)
 		group = append(group, dup)
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := writeGroup(); err != nil {
 		return err

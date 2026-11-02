@@ -24,3 +24,26 @@ func TestValueComparison(t *testing.T) {
 		}
 	}
 }
+
+func TestPairValueComparison(t *testing.T) {
+	cases := []struct {
+		want, got string
+		ok        bool
+	}{
+		{"'oss/12'", "oss/12", true},
+		{"'oss/12'", "oss/13", false},
+		{"12345", "12345", true},
+		{"12345", "12346", false},
+		{"12.34", "12.34", true},
+		{"12.34", "12.340", true},
+		{"true", "1", true},
+		{"true", "0", false},
+		{"false", "0", true},
+		{"false", "1", false},
+	}
+	for _, c := range cases {
+		if got := pairValueEqual(c.want, c.got); got != c.ok {
+			t.Fatalf("pairValueEqual(%q, %q) = %v, want %v", c.want, c.got, got, c.ok)
+		}
+	}
+}

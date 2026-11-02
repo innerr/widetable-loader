@@ -14,7 +14,6 @@ package bench
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -38,6 +37,7 @@ type Params struct {
 	Table     string  `json:"table"`
 	Threads   int     `json:"threads"`
 	DurationS int     `json:"duration_s"`
+	WarmupS   int     `json:"warmup_s"`   // unrecorded warmup before the measured window
 	ReadRatio float64 `json:"read_ratio"` // 0..1; rest is writes
 
 	// Key range, same semantics as gen:
@@ -49,6 +49,10 @@ type Params struct {
 	// Row shape, same semantics as gen:
 	FixedCols int    `json:"fixed_cols"` // f1..fN declared before the c columns
 	Fill      int    `json:"fill"`       // columns written per split row (<= file cols)
+	// 宽表实际列清单（逗号分隔，不含 id）与其中的数字列。为空时用 gen 生成的
+	// c000001.. 列名，仅适用于声明列形态的表。
+	Columns string `json:"columns"`
+	Numeric string `json:"numeric_columns"`
 	RowWidth  int    `json:"row_width"`
 	Seed      uint64 `json:"seed"`
 }
@@ -61,14 +65,49 @@ type Report struct {
 	ReadRPS    float64 `json:"read_rps"`
 	WriteRPS   float64 `json:"write_rps"`
 	Errors     int64   `json:"errors"`
-	WriteP99MS float64 `json:"write_p99_ms"`
+	ReadBytes  int64   `json:"read_bytes"`
+	WriteRows  int64   `json:"write_rows"`
+	WriteStmts int64   `json:"write_statements"`
+	ReadMBPS   float64 `json:"read_mb_per_sec"`
+	ReadP50MS  float64 `json:"read_p50_ms"`
+	ReadP95MS  float64 `json:"read_p95_ms"`
+	ReadP99MS  float64 `json:"read_p99_ms"`
 	WriteP50MS float64 `json:"write_p50_ms"`
+	WriteP95MS float64 `json:"write_p95_ms"`
+	WriteP99MS float64 `json:"write_p99_ms"`
+}
+
+// columnList 返回要写的列名与数字列集合。
+func (this Params) columnList(cfg gen.Config) ([]string, map[string]bool) {
+	numeric := map[string]bool{}
+	for _, name := range strings.Split(this.Numeric, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			numeric[name] = true
+		}
+	}
+	if this.Columns == "" {
+		cols := cfg.ColumnNames()[1:]
+		for index := range cols {
+			if index < cfg.FixedCols && index != 2 && index != 3 {
+				numeric[cols[index]] = true
+			}
+		}
+		return cols, numeric
+	}
+	var cols []string
+	for _, name := range strings.Split(this.Columns, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			cols = append(cols, name)
+		}
+	}
+	return cols, numeric
 }
 
 func (this Params) Validate() error {
 	if this.DSN == "" || this.Table == "" || this.Threads < 1 || this.DurationS < 1 ||
+		this.WarmupS < 0 || this.WarmupS >= this.DurationS ||
 		math.IsNaN(this.ReadRatio) || this.ReadRatio < 0 || this.ReadRatio > 1 || this.Fill < 1 {
-		return fmt.Errorf("dsn, table, positive threads/duration/fill and read-ratio in [0,1] are required")
+		return fmt.Errorf("dsn, table, positive threads/duration/fill, warmup below duration and read-ratio in [0,1] are required")
 	}
 	cfg := gen.Config{TotalRows: this.TotalRows, Segments: this.Segments, Scatter: this.Scatter,
 		GapFactor: this.GapFactor, Fields: this.Fill, Fill: this.Fill, FixedCols: this.FixedCols, RowWidth: this.RowWidth}
@@ -94,6 +133,7 @@ func Run(args []string) error {
 	fs.StringVar(&p.Table, "table", "", "target table")
 	fs.IntVar(&p.Threads, "threads", 16, "concurrent client threads")
 	fs.IntVar(&p.DurationS, "duration", 600, "run duration in seconds")
+	fs.IntVar(&p.WarmupS, "warmup", 0, "unrecorded warmup seconds before the measured window")
 	fs.Float64Var(&p.ReadRatio, "read-ratio", 0.5, "read fraction 0..1 (rest is split-row UPSERT writes)")
 	fs.Uint64Var(&p.Segments, "segments", 0, "segment count the data was generated with")
 	fs.Uint64Var(&p.TotalRows, "total-rows", 0, "total rows the data was generated with")
@@ -119,8 +159,9 @@ func Run(args []string) error {
 		p.Scatter = "blocked"
 	}
 	return RunWithReport(context.Background(), p, func(r Report) {
-		fmt.Printf("[bench] %.0fs reads %d (%.0f/s) writes %d (%.0f/s) errs %d p50 %.1fms p99 %.1fms\n",
-			r.ElapsedS, r.Reads, r.ReadRPS, r.Writes, r.WriteRPS, r.Errors, r.WriteP50MS, r.WriteP99MS)
+		fmt.Printf("[bench] %.0fs reads %d (%.0f/s) %.1f MB/s p50 %.1fms p99 %.1fms, writes %d (%.0f/s) errs %d\n",
+			r.ElapsedS, r.Reads, r.ReadRPS, r.ReadMBPS, r.ReadP50MS, r.ReadP99MS,
+			r.Writes, r.WriteRPS, r.Errors)
 	})
 }
 
@@ -166,10 +207,13 @@ func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 		}
 		layouts = append(layouts, l)
 	}
-	var reads, writes, errs int64
-	latCh := make(chan float64, 1<<16) // write latencies in ms, for percentiles
+	var reads, writes, errs, readBytes, writeRows, writeStmts int64
+	// 延迟按样本全量收集：中间进度不复位，分位只在最终报告里算一次。
+	// 600 秒 × 数千次每秒约几百万个样本，几十 MB，可接受。
+	var latencies latencySamples
 
 	start := time.Now()
+	measureStart := start.Add(time.Duration(p.WarmupS) * time.Second)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -185,7 +229,8 @@ func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 			case <-stopRep:
 				return
 			case <-t.C:
-				report(&reads, &writes, &errs, start, latCh, false, onReport)
+				report(&reads, &writes, &errs, &readBytes, &writeRows, &writeStmts, measureStart,
+					&latencies, false, onReport)
 			}
 		}
 	}()
@@ -197,7 +242,8 @@ func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
-			if err := runThread(ctx, p, cfg, rps, gapLo, gapHi, layouts, rng, &reads, &writes, &errs, latCh); err != nil && ctx.Err() == nil {
+			if err := runThread(ctx, p, cfg, rps, gapLo, gapHi, layouts, rng, measureStart,
+				&reads, &writes, &errs, &readBytes, &writeRows, &writeStmts, &latencies); err != nil && ctx.Err() == nil {
 				errCh <- err
 				cancel()
 			}
@@ -219,7 +265,8 @@ func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 	}
 	close(stopRep)
 	<-repDone
-	report(&reads, &writes, &errs, start, latCh, true, onReport)
+	report(&reads, &writes, &errs, &readBytes, &writeRows, &writeStmts, measureStart,
+		&latencies, true, onReport)
 	select {
 	case err := <-errCh:
 		return err
@@ -228,39 +275,68 @@ func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 	return parent.Err()
 }
 
-func report(reads, writes, errs *int64, start time.Time, latCh chan float64, final bool, onReport func(Report)) {
-	el := time.Since(start).Seconds()
+// latencySamples collects read and write latencies for one run.
+type latencySamples struct {
+	mu     sync.Mutex
+	reads  []float64
+	writes []float64
+}
+
+func (this *latencySamples) addRead(ms float64) {
+	this.mu.Lock()
+	this.reads = append(this.reads, ms)
+	this.mu.Unlock()
+}
+
+func (this *latencySamples) addWrite(ms float64) {
+	this.mu.Lock()
+	this.writes = append(this.writes, ms)
+	this.mu.Unlock()
+}
+
+func report(reads, writes, errs, readBytes, writeRows, writeStmts *int64, measureStart time.Time,
+	latencies *latencySamples, final bool, onReport func(Report)) {
+	el := time.Since(measureStart).Seconds()
+	if el < 0 {
+		el = 0
+	}
 	r := Report{
-		ElapsedS: el,
-		Reads:    atomic.LoadInt64(reads),
-		Writes:   atomic.LoadInt64(writes),
-		Errors:   atomic.LoadInt64(errs),
+		ElapsedS:  el,
+		Reads:     atomic.LoadInt64(reads),
+		Writes:    atomic.LoadInt64(writes),
+		Errors:    atomic.LoadInt64(errs),
+		ReadBytes:  atomic.LoadInt64(readBytes),
+		WriteRows:  atomic.LoadInt64(writeRows),
+		WriteStmts: atomic.LoadInt64(writeStmts),
 	}
 	if el > 0 {
 		r.ReadRPS = float64(r.Reads) / el
 		r.WriteRPS = float64(r.Writes) / el
+		r.ReadMBPS = float64(r.ReadBytes) / el / 1e6
 	}
-	// Drain latencies for percentiles.
-	var lats []float64
-	for {
-		select {
-		case v := <-latCh:
-			lats = append(lats, v)
-		default:
-			goto done
-		}
-	}
-done:
-	if len(lats) > 0 {
-		sort.Float64s(lats)
-		r.WriteP50MS = lats[len(lats)/2]
-		r.WriteP99MS = lats[len(lats)*99/100]
+	if final {
+		latencies.mu.Lock()
+		readLats := append([]float64(nil), latencies.reads...)
+		writeLats := append([]float64(nil), latencies.writes...)
+		latencies.mu.Unlock()
+		r.ReadP50MS, r.ReadP95MS, r.ReadP99MS = percentiles(readLats)
+		r.WriteP50MS, r.WriteP95MS, r.WriteP99MS = percentiles(writeLats)
 	}
 	onReport(r)
 }
 
+func percentiles(lats []float64) (p50, p95, p99 float64) {
+	if len(lats) == 0 {
+		return 0, 0, 0
+	}
+	sort.Float64s(lats)
+	return lats[len(lats)/2], lats[len(lats)*95/100], lats[len(lats)*99/100]
+}
+
 // runThread loops until ctx is done, mixing point reads and split writes.
-func runThread(ctx context.Context, p Params, cfg gen.Config, rps, gapLo, gapHi uint64, layouts []genkey.Layout, rng *rand.Rand, reads, writes, errs *int64, latCh chan float64) error {
+func runThread(ctx context.Context, p Params, cfg gen.Config, rps, gapLo, gapHi uint64,
+	layouts []genkey.Layout, rng *rand.Rand, measureStart time.Time,
+	reads, writes, errs, readBytes, writeRows, writeStmts *int64, latencies *latencySamples) error {
 	db, err := sql.Open("mysql", p.DSN)
 	if err != nil {
 		return err
@@ -271,103 +347,149 @@ func runThread(ctx context.Context, p Params, cfg gen.Config, rps, gapLo, gapHi 
 		return workloadError(ctx, errs, "connect", err)
 	}
 
-	cols := cfg.ColumnNames() // id, f1.., c000001..
+	declared, numeric := p.columnList(cfg) // 不含 id
 	for ctx.Err() == nil {
+		measured := !time.Now().Before(measureStart)
 		if rng.Float64() < p.ReadRatio {
-			if err := pointRead(ctx, db, p.Table, cols, rps, layouts, rng, cfg, reads, errs); err != nil {
+			t0 := time.Now()
+			size, err := pointRead(ctx, db, p.Table, rps, layouts, rng, cfg, errs)
+			if err != nil {
 				return err
+			}
+			if measured {
+				atomic.AddInt64(reads, 1)
+				atomic.AddInt64(readBytes, int64(size))
+				latencies.addRead(float64(time.Since(t0).Microseconds()) / 1000)
 			}
 		} else {
 			t0 := time.Now()
-			if err := splitWrite(ctx, db, p.Table, cols, gapLo, gapHi, layouts, rng, cfg, writes, errs); err != nil {
+			rows, statements, err := splitWrite(ctx, db, p.Table, declared, numeric, gapLo, gapHi,
+				layouts, rng, cfg, errs)
+			if err != nil {
 				return err
 			}
-			select {
-			case latCh <- float64(time.Since(t0).Microseconds()) / 1000:
-			default:
+			if measured {
+				atomic.AddInt64(writes, 1)
+				atomic.AddInt64(writeRows, int64(rows))
+				atomic.AddInt64(writeStmts, int64(statements))
+			}
+			if measured {
+				latencies.addWrite(float64(time.Since(t0).Microseconds()) / 1000)
 			}
 		}
 	}
 	return nil
 }
 
-// pointRead: uniform pick on occupied ranges, SELECT by pk.
-func pointRead(ctx context.Context, db *sql.DB, table string, cols []string, rps uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config, reads, errs *int64) error {
+// pointRead: uniform pick on occupied ranges, whole-row SELECT by pk.
+// It returns the bytes of the decoded row so the caller can report read
+// bandwidth; the row must be fully received before the read counts.
+func pointRead(ctx context.Context, db *sql.DB, table string, rps uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config, errs *int64) (int, error) {
 	seg := rng.Uint64() % cfg.Segments
 	id := layouts[seg].ID(seg*rps + rng.Uint64()%rps)
-	var dummy int64
-	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE id = %d", sqlutil.QuoteIdentifier(table), id)).Scan(&dummy); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return workloadError(ctx, errs, "point read", fmt.Errorf("generated key %d is missing", id))
-		}
-		return workloadError(ctx, errs, "point read", err)
+	// 宽表要求 SELECT * 带字面量 LIMIT，否则报 "does not support SELECT *"。
+	rows, err := db.QueryContext(ctx,
+		fmt.Sprintf("SELECT * FROM %s WHERE id = %d LIMIT 1", sqlutil.QuoteIdentifier(table), id))
+	if err != nil {
+		return 0, workloadError(ctx, errs, "point read", err)
 	}
-	atomic.AddInt64(reads, 1)
-	return nil
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return 0, workloadError(ctx, errs, "point read", err)
+	}
+	raw := make([]sql.RawBytes, len(columns))
+	dest := make([]any, len(columns))
+	for i := range raw {
+		dest[i] = &raw[i]
+	}
+	size, found := 0, 0
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return 0, workloadError(ctx, errs, "point read", err)
+		}
+		for _, value := range raw {
+			size += len(value)
+		}
+		found++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, workloadError(ctx, errs, "point read", err)
+	}
+	if found == 0 {
+		return 0, workloadError(ctx, errs, "point read", fmt.Errorf("generated key %d is missing", id))
+	}
+	return size, nil
 }
 
-// splitWrite: one transaction of 2-3 split-row UPSERTs into gap keys.
-// Each split row writes a distinct column subset, so the 2-3 rows together
-// form one full wide row (the baseline's "split-row UPSERT" shape).
-func splitWrite(ctx context.Context, db *sql.DB, table string, cols []string, gapLo, gapHi uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config, writes, errs *int64) error {
+// splitWrite: one transaction writing 2-3 new rows into gap keys. Each row is
+// written by 2-3 UPSERT statements that split its column subset, so a row costs
+// several statements but only one row in the table.
+func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string, numeric map[string]bool,
+	gapLo, gapHi uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
+	errs *int64) (rows int, statements int, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return workloadError(ctx, errs, "begin", err)
+		return 0, 0, workloadError(ctx, errs, "begin", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	parts := 2 + int(rng.Intn(2)) // 2 or 3 split rows
-	declared := cols[1:]          // without id
-	// Shuffle column indices once, then split into parts.
-	perm := rng.Perm(len(declared))
-	perPart := (len(perm) + parts - 1) / parts
-
-	seg := rng.Uint64() % cfg.Segments
-	seq := gapLo + rng.Uint64()%(gapHi-gapLo)
-	if cfg.Scatter == "blocked" {
-		seq = seg*cfg.RowsPerSeg() + cfg.RowsPerSeg() + rng.Uint64()%(cfg.Stride()-cfg.RowsPerSeg())
-	}
-	id := layouts[seg].ID(seq)
-	for k := 0; k < parts; k++ {
-		lo := k * perPart
-		if lo >= len(perm) {
-			break
+	rowsPerTx := 2 + int(rng.Intn(2)) // 2 or 3 new rows per event
+	for r := 0; r < rowsPerTx; r++ {
+		seg := rng.Uint64() % cfg.Segments
+		seq := gapLo + rng.Uint64()%(gapHi-gapLo)
+		if cfg.Scatter == "blocked" {
+			seq = seg*cfg.RowsPerSeg() + cfg.RowsPerSeg() + rng.Uint64()%(cfg.Stride()-cfg.RowsPerSeg())
 		}
-		hi := lo + perPart
-		if hi > len(perm) {
-			hi = len(perm)
-		}
-		subset := perm[lo:hi]
-		if len(subset) == 0 {
-			continue
-		}
-		// gap key: any global sequence outside the occupied domain,
-		// mapped through one segment's layout.
-		colNames := make([]string, 0, len(subset)+1)
-		colNames = append(colNames, "id")
-		placeholders := make([]string, 0, len(subset)+1)
-		placeholders = append(placeholders, "?")
-		args := make([]interface{}, 0, len(subset)+1)
-		args = append(args, id)
-		updates := make([]string, 0, len(subset))
-		for _, ci := range subset {
-			name := declared[ci]
-			colNames = append(colNames, name)
+		id := layouts[seg].ID(seq)
+		perRow := 2 + int(rng.Intn(2)) // 2 or 3 statements per row
+		perm := rng.Perm(len(declared))
+		perStatement := (len(perm) + perRow - 1) / perRow
+		wrote := false
+		for k := 0; k < perRow; k++ {
+			lo := k * perStatement
+			if lo >= len(perm) {
+				break
+			}
+			hi := lo + perStatement
+			if hi > len(perm) {
+				hi = len(perm)
+			}
+			subset := perm[lo:hi]
+			if len(subset) == 0 {
+				continue
+			}
+			colNames := make([]string, 0, len(subset)+1)
+			colNames = append(colNames, "id")
+			placeholders := make([]string, 0, len(subset)+1)
 			placeholders = append(placeholders, "?")
-			args = append(args, benchColumnValue(rng, ci, cfg, len(subset)))
-			updates = append(updates, fmt.Sprintf("%s=VALUES(%s)", name, name))
+			args := make([]interface{}, 0, len(subset)+1)
+			args = append(args, id)
+			for _, ci := range subset {
+				name := declared[ci]
+				colNames = append(colNames, name)
+				placeholders = append(placeholders, "?")
+				args = append(args, benchColumn(name, numeric[name], rng, cfg, len(subset)))
+			}
+			// 宽表不支持 ON DUPLICATE KEY UPDATE；撞主键的 INSERT 本身就是
+			// 按列合并的 upsert，正是客户 partial upsert 的语义。
+			sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+				sqlutil.QuoteIdentifier(table), strings.Join(colNames, ","),
+				strings.Join(placeholders, ","))
+			if _, err := tx.ExecContext(ctx, sql, args...); err != nil {
+				return rows, statements, workloadError(ctx, errs, "split upsert", err)
+			}
+			wrote = true
+			statements++
 		}
-		sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON DUPLICATE KEY UPDATE %s",
-			sqlutil.QuoteIdentifier(table), strings.Join(colNames, ","), strings.Join(placeholders, ","), strings.Join(updates, ","))
-		if _, err := tx.ExecContext(ctx, sql, args...); err != nil {
-			return workloadError(ctx, errs, "split upsert", err)
+		if wrote {
+			rows++
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return workloadError(ctx, errs, "commit", err)
+		return rows, statements, workloadError(ctx, errs, "commit", err)
 	}
-	atomic.AddInt64(writes, 1)
-	return nil
+	return rows, statements, nil
 }
 
 func workloadError(ctx context.Context, errs *int64, action string, err error) error {
@@ -376,6 +498,15 @@ func workloadError(ctx context.Context, errs *int64, action string, err error) e
 	}
 	atomic.AddInt64(errs, 1)
 	return fmt.Errorf("%s: %w", action, err)
+}
+
+// benchColumn：数字列给整数，其余给字符串（宽表动态列只接受字符串，
+// 字符串长度按目标行宽摊到本行的列数上）。
+func benchColumn(name string, numeric bool, rng *rand.Rand, cfg gen.Config, count int) any {
+	if !numeric {
+		return benchValue(rng, cfg.RowWidth, count)
+	}
+	return int64(1700000000) + rng.Int63n(1000000)
 }
 
 func benchColumnValue(rng *rand.Rand, idx int, cfg gen.Config, count int) any {

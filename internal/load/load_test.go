@@ -313,3 +313,27 @@ func TestCancellation(t *testing.T) {
 		t.Fatal("canceled run succeeded")
 	}
 }
+
+// Pre-rendered .sql segments are replayed one statement per line, so the
+// grouping --multi-row drives never happens. The flag used to be accepted and
+// ignored (the 2026-10-26 定稿轮 passed --multi-row 50 on a .sql dataset and
+// grouped nothing), so the mismatch must be refused before any row is written.
+func TestMultiRowRejectedOnSQLSegments(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seg-0.sql"), []byte("INSERT INTO t VALUES (1);\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := Params{DSN: "u:p@tcp(localhost:3306)/db", Table: "items", Dir: dir, Workers: 1, BatchRows: 2, Entry: "insert"}
+	withMultiRow := base
+	withMultiRow.MultiRow = 50
+	err := RunWithProgress(context.Background(), withMultiRow, func(Progress) {})
+	if err == nil || !strings.Contains(err.Error(), "no effect on .sql segments") {
+		t.Fatalf("--multi-row on .sql segments not refused: %v", err)
+	}
+	// Without --multi-row the same directory passes this check and only fails
+	// later, when it tries to reach the database.
+	err = RunWithProgress(context.Background(), base, func(Progress) {})
+	if err != nil && strings.Contains(err.Error(), "no effect on .sql segments") {
+		t.Fatalf("refused a valid invocation: %v", err)
+	}
+}
