@@ -3,16 +3,25 @@ package gen
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/innerr/widetable-loader/internal/genkey"
 )
 
-// Run parses flags and generates one segment file.
+// Run parses flags and generates one segment file. The special form
+// Run(["keyseq-bounds", ...]) writes the segment boundary table of a keyseq
+// dataset (the primary-key range of every segment) as JSON, for use as
+// explicit presplit keys.
 func Run(args []string) error {
+	if len(args) > 0 && args[0] == "keyseq-bounds" {
+		return runKeySeqBounds(args[1:])
+	}
 	fs := flag.NewFlagSet("gen", flag.ContinueOnError)
 	var (
 		cfg         Config
@@ -24,9 +33,11 @@ func Run(args []string) error {
 		sqlUpsert   = fs.Bool("sql-upsert", false, "sql format: append ON DUPLICATE KEY UPDATE")
 		indexCols   = fs.String("index-cols", "", "comma-separated declared columns carrying secondary indexes, e.g. c000001,c000003; overrides -index-fields")
 	)
+	fs.BoolVar(&cfg.WriteHashSidecar, "write-hash-sidecar", false,
+		"write each segment's content hash next to it, so a later import can skip hashing the dataset; off by default (matches earlier rounds)")
 	fs.Uint64Var(&cfg.TotalRows, "total-rows", 0, "total rows across all segments")
 	fs.Uint64Var(&cfg.Segments, "segments", 8, "total segment count")
-	fs.StringVar(&cfg.Scatter, "scatter", "hash32", "key layout: hash32 (customer scatter, default) | blocked | none | mul-hash")
+	fs.StringVar(&cfg.Scatter, "scatter", "hash32", "key layout: hash32 (customer scatter, default) | keyseq (key-ordered segments with disjoint ranges) | blocked | none | mul-hash")
 	fs.Uint64Var(&cfg.GapFactor, "gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor (gap is left for post-import writes)")
 	fs.Uint64Var(&cfg.Seed, "seed", 1, "random seed; regenerated data is byte-identical for the same seed and parameters")
 	fs.IntVar(&cfg.Fields, "fields", 5000, "declared column count in the table schema (c000001..cN)")
@@ -36,6 +47,7 @@ func Run(args []string) error {
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (index fields included)")
 	fs.IntVar(&cfg.RowWidth, "row-width", 1024, "target row width in bytes")
 	fs.IntVar(&cfg.FillBuckets, "fill-buckets", 0, ">0: cycle through N pre-picked column sets instead of per-row random (enables multi-row INSERT)")
+	pairRawSpec := RegisterPairFlags(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -63,6 +75,41 @@ func Run(args []string) error {
 		cfg.IndexCols = cols
 		cfg.IndexFields = len(cols)
 	}
+	if cfg.PairCatalog > 0 {
+		if !sql {
+			return fmt.Errorf("pair mode writes per-row column lists and requires -format sql")
+		}
+		spec, err := ParsePairRawDist(*pairRawSpec)
+		if err != nil {
+			return err
+		}
+		cfg.PairRawDist = spec
+		// A multi-row INSERT statement has one column list, so the rows in a
+		// group must fill exactly the same columns. With per-row random fills
+		// (fill-buckets 0) the second row always breaks the group, so the flag
+		// would silently do nothing and every statement ends up holding one row.
+		// Refuse instead of degrading quietly.
+		if *sqlMultiRow > 1 && cfg.FillBuckets == 0 {
+			return fmt.Errorf("-sql-multi-row %d has no effect in pair mode without -fill-buckets: "+
+				"per-row random column sets break the group on the second row, so every statement holds one row; "+
+				"set -fill-buckets 1 to actually group %d rows per statement, or drop -sql-multi-row",
+				*sqlMultiRow, *sqlMultiRow)
+		}
+		// Bucket rows only matter when buckets exist, and cycling buckets per
+		// row defeats grouping -- the value below 1 changes nothing.
+		if cfg.PairBucketRows != 0 && cfg.FillBuckets == 0 {
+			return fmt.Errorf("-pair-bucket-rows %d has no effect without -fill-buckets: "+
+				"column sets are picked per row, so there is no bucket to spread rows across", cfg.PairBucketRows)
+		}
+		if cfg.PairBucketRows < 0 {
+			return fmt.Errorf("-pair-bucket-rows must be nonnegative")
+		}
+		if sql && *sqlUpsert {
+			return fmt.Errorf("-sql-upsert is not supported in pair mode: pair output builds its own column list per statement")
+		}
+	} else if cfg.PairBucketRows != 0 {
+		return fmt.Errorf("-pair-bucket-rows requires -pair-catalog (pair mode is off)")
+	}
 
 	g, err := NewGenerator(cfg, *segment)
 	if err != nil {
@@ -85,7 +132,11 @@ func Run(args []string) error {
 		defer f.Close()
 		defer os.Remove(f.Name())
 		w = f
-		if sql {
+		if sql && cfg.PairCatalog > 0 {
+			if err := g.WriteSQLPairsMultiRow(bufio.NewWriterSize(f, 1<<20), *sqlTable, *sqlMultiRow); err != nil {
+				return err
+			}
+		} else if sql {
 			if err := g.WriteSQL(bufio.NewWriterSize(f, 1<<20), *sqlTable, *sqlMultiRow, *sqlUpsert); err != nil {
 				return err
 			}
@@ -101,9 +152,12 @@ func Run(args []string) error {
 		if err := f.Close(); err != nil {
 			return err
 		}
-		return publishSegment(f.Name(), *out, !sql)
+		return publishSegment(f.Name(), *out, !sql, cfg.WriteHashSidecar)
 	}
 	if sql {
+		if cfg.PairCatalog > 0 {
+			return g.WriteSQLPairsMultiRow(bufio.NewWriterSize(w, 1<<20), *sqlTable, *sqlMultiRow)
+		}
 		return g.WriteSQL(bufio.NewWriterSize(w, 1<<20), *sqlTable, *sqlMultiRow, *sqlUpsert)
 	}
 	buf := bufio.NewWriterSize(w, 1<<20)
@@ -115,8 +169,11 @@ func Run(args []string) error {
 
 // publishSegment never overwrites data or the column list from an earlier
 // run; the column sidecar is only linked for csv segments (sql statements
-// carry their own column lists).
-func publishSegment(stage, out string, columns bool) error {
+// carry their own column lists). With writeHash it also writes the segment's
+// content hash next to it, so a later import can read the hash instead of
+// hashing the segment (and its column sidecar) again before the first row is
+// written; this is off by default.
+func publishSegment(stage, out string, columns bool, writeHash bool) error {
 	if columns {
 		if err := os.Link(stage+".columns", out+".columns"); err != nil {
 			return err
@@ -126,12 +183,22 @@ func publishSegment(stage, out string, columns bool) error {
 		os.Remove(out + ".columns")
 		return err
 	}
+	if !writeHash {
+		return nil
+	}
+	if err := WriteHashSidecar(out, columns); err != nil {
+		os.Remove(out)
+		if columns {
+			os.Remove(out + ".columns")
+		}
+		return err
+	}
 	return nil
 }
 
 // PublishSegment is the exported publish path for daemon-driven generation.
-func PublishSegment(stage, out string, columns bool) error {
-	return publishSegment(stage, out, columns)
+func PublishSegment(stage, out string, columns bool, writeHash bool) error {
+	return publishSegment(stage, out, columns, writeHash)
 }
 
 // WriteCSV writes every row of the generator's segment as CSV.
@@ -140,17 +207,74 @@ func (g *Generator) WriteCSV(w *bufio.Writer) error {
 }
 
 func (this *Generator) WriteCSVContext(ctx context.Context, w *bufio.Writer) error {
-	for seq := this.row0; seq < this.row1; seq++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	return this.forEachSeq(ctx, func(seq uint64) error {
 		record, err := this.Next(seq)
 		if err != nil {
 			return err
 		}
 		writeRecord(w, record)
+		return nil
+	})
+}
+
+// runKeySeqBounds emits the key range of every keyseq segment as one JSON
+// object; segments are consecutive ranks of the global key order, so the
+// max_id of segment i is below the min_id of segment i+1.
+func runKeySeqBounds(args []string) error {
+	fs := flag.NewFlagSet("gen keyseq-bounds", flag.ContinueOnError)
+	totalRows := fs.Uint64("total-rows", 0, "total rows across all segments")
+	segments := fs.Uint64("segments", 0, "total segment count")
+	out := fs.String("out", "", "output file (default stdout)")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	return w.Flush()
+	if *totalRows == 0 || *segments == 0 || *totalRows%*segments != 0 {
+		return fmt.Errorf("--total-rows and --segments are required, rows divisible by segments")
+	}
+	if *totalRows > 1<<32 {
+		return fmt.Errorf("keyseq supports at most 2^32 rows")
+	}
+	rowsPerSeg := *totalRows / *segments
+	ks := genkey.BuildKeySeq(*totalRows, genkey.Hash32Prefix{}.ID)
+	type segBound struct {
+		Segment uint64 `json:"segment"`
+		MinID   uint64 `json:"min_id"`
+		MaxID   uint64 `json:"max_id"`
+		MinHash uint32 `json:"min_hash32"`
+		MaxHash uint32 `json:"max_hash32"`
+		Rows    uint64 `json:"rows"`
+	}
+	doc := struct {
+		Scatter        string     `json:"scatter"`
+		TotalRows      uint64     `json:"total_rows"`
+		Segments       uint64     `json:"segments"`
+		RowsPerSegment uint64     `json:"rows_per_segment"`
+		Bounds         []segBound `json:"bounds"`
+	}{
+		Scatter:        "keyseq",
+		TotalRows:      *totalRows,
+		Segments:       *segments,
+		RowsPerSegment: rowsPerSeg,
+		Bounds:         make([]segBound, 0, *segments),
+	}
+	for s := uint64(0); s < *segments; s++ {
+		minID, maxID := ks.SegmentBounds(s, rowsPerSeg)
+		doc.Bounds = append(doc.Bounds, segBound{Segment: s, MinID: minID, MaxID: maxID,
+			MinHash: ks.HashAt(s * rowsPerSeg), MaxHash: ks.HashAt((s+1)*rowsPerSeg - 1), Rows: rowsPerSeg})
+	}
+	blob, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	blob = append(blob, '\n')
+	if *out == "" {
+		_, err = os.Stdout.Write(blob)
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(*out, blob, 0o644)
 }
 
 // writeRecord writes one row: empty fields as \N (SQL NULL), non-empty

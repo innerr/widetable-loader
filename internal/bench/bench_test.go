@@ -51,15 +51,20 @@ func TestSplitWritesOneCompleteRow(t *testing.T) {
 	defer db.Exec("DROP TABLE loader_split_write")
 	cfg := gen.Config{TotalRows: 4, Segments: 1, Scatter: "hash32", GapFactor: 2, Fields: 5, Fill: 5, RowWidth: 32}
 	layout, _ := cfg.Layout(0)
-	var writes, errs int64
-	err = splitWrite(context.Background(), db, "loader_split_write", cfg.ColumnNames(), 4, 8,
-		[]genkey.Layout{layout}, rand.New(rand.NewSource(7)), cfg, &writes, &errs)
+	var errs int64
+	numeric := map[string]bool{}
+	rows, statements, err := splitWrite(context.Background(), db, "loader_split_write",
+		cfg.ColumnNames()[1:], numeric, 4, 8, []genkey.Layout{layout},
+		rand.New(rand.NewSource(7)), cfg, &errs)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if rows < 2 || rows > 3 || statements < rows*2 {
+		t.Fatal("one event must write 2-3 rows with 2-3 statements each:", rows, statements)
+	}
 	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM loader_split_write WHERE c000001 IS NOT NULL AND c000002 IS NOT NULL AND c000003 IS NOT NULL AND c000004 IS NOT NULL AND c000005 IS NOT NULL").Scan(&count); err != nil || count != 1 {
-		t.Fatal("split write did not create one complete row:", count, err)
+	if err := db.QueryRow("SELECT COUNT(*) FROM loader_split_write WHERE c000001 IS NOT NULL AND c000002 IS NOT NULL AND c000003 IS NOT NULL AND c000004 IS NOT NULL AND c000005 IS NOT NULL").Scan(&count); err != nil || count != rows {
+		t.Fatal("split write did not create the complete rows:", count, rows, err)
 	}
 	var final Report
 	params := Params{DSN: dsn, Table: "loader_split_write", Threads: 1, DurationS: 1, ReadRatio: 0,

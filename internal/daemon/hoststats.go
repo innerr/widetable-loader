@@ -19,8 +19,10 @@ type HostStats struct {
 	LoadAvg1   float64 `json:"load_avg_1"`
 	MemTotalKB uint64  `json:"mem_total_kb"`
 	MemAvailKB uint64  `json:"mem_avail_kb"`
-	DiskIOPS   float64 `json:"disk_iops"` // whole block devices, excluding partitions
+	DiskIOPS   float64 `json:"disk_iops"` // one block device when --disk-mount is set, else all devices
 	DiskKBs    float64 `json:"disk_kb_per_sec"`
+	DiskDevice string  `json:"disk_device"`
+	NetKBs     float64 `json:"net_kb_per_sec"` // all interfaces except loopback
 	SampleSec  float64 `json:"sample_sec"`
 }
 
@@ -68,7 +70,10 @@ type diskSample struct {
 	reads, writes, rKB, wKB uint64
 }
 
-func readDiskSample() (diskSample, error) {
+// readDiskSample sums the counters of whole block devices. With a device name
+// only that device is read: the engine data disk is what an import saturates,
+// and adding the source-data disk hides it.
+func readDiskSample(device string) (diskSample, error) {
 	f, err := os.Open("/proc/diskstats")
 	if err != nil {
 		return diskSample{}, err
@@ -87,6 +92,9 @@ func readDiskSample() (diskSample, error) {
 			strings.HasPrefix(name, "dm-") || strings.HasPrefix(name, "md") {
 			continue
 		}
+		if device != "" && name != device {
+			continue
+		}
 		if _, err := os.Stat(filepath.Join("/sys/block", name)); err != nil {
 			continue
 		}
@@ -96,6 +104,60 @@ func readDiskSample() (diskSample, error) {
 		s.wKB += atoui(fields[9]) / 2
 	}
 	return s, sc.Err()
+}
+
+type netSample struct{ rx, tx uint64 }
+
+func readNetSample() netSample {
+	f, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return netSample{}
+	}
+	defer f.Close()
+	var s netSample
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		name := strings.TrimSpace(line[:idx])
+		if name == "lo" || name == "" {
+			continue
+		}
+		fields := strings.Fields(line[idx+1:])
+		if len(fields) < 9 {
+			continue
+		}
+		s.rx += atoui(fields[0])
+		s.tx += atoui(fields[8])
+	}
+	return s
+}
+
+// resolveMountDevice maps a mount point to its block device name, e.g.
+// /data/nvme -> nvme0n1. Nodes differ in device names, so the daemon reads it
+// from /proc/mounts instead of taking it from configuration.
+func resolveMountDevice(mount string) string {
+	if mount == "" {
+		return ""
+	}
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 || fields[1] != mount {
+			continue
+		}
+		dev := fields[0]
+		return dev[strings.LastIndex(dev, "/")+1:]
+	}
+	return ""
 }
 
 func atoui(s string) uint64 {
@@ -140,12 +202,14 @@ func readLoadAvg() float64 {
 
 // sampleHostStats takes two CPU/disk samples separated by interval and
 // returns one HostStats.
-func sampleHostStats(interval time.Duration) HostStats {
+func sampleHostStats(interval time.Duration, device string) HostStats {
 	c0, _ := readCPUSample()
-	d0, _ := readDiskSample()
+	d0, _ := readDiskSample(device)
+	n0 := readNetSample()
 	time.Sleep(interval)
 	c1, _ := readCPUSample()
-	d1, _ := readDiskSample()
+	d1, _ := readDiskSample(device)
+	n1 := readNetSample()
 
 	var hs HostStats
 	if c1.total > c0.total {
@@ -157,10 +221,12 @@ func sampleHostStats(interval time.Duration) HostStats {
 	hs.SampleSec = interval.Seconds()
 	hs.CPUs = numCPUs()
 	hs.LoadAvg1 = readLoadAvg()
+	hs.DiskDevice = device
 	hs.MemTotalKB, hs.MemAvailKB = readMemInfo()
 	if hs.SampleSec > 0 {
 		hs.DiskIOPS = float64(d1.reads+d1.writes-d0.reads-d0.writes) / hs.SampleSec
 		hs.DiskKBs = float64(d1.rKB+d1.wKB-d0.rKB-d0.wKB) / hs.SampleSec
+		hs.NetKBs = float64(n1.rx+n1.tx-n0.rx-n0.tx) / 1024.0 / hs.SampleSec
 	}
 	return hs
 }
@@ -191,5 +257,5 @@ func (this *Server) handleHostStats(w http.ResponseWriter, r *http.Request) {
 		}
 		interval = time.Duration(f * float64(time.Second))
 	}
-	writeJSON(w, http.StatusOK, sampleHostStats(interval))
+	writeJSON(w, http.StatusOK, sampleHostStats(interval, this.DiskDevice))
 }

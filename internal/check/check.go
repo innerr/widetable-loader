@@ -50,6 +50,7 @@ func Run(args []string) error {
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (must match gen)")
 	fs.IntVar(&cfg.RowWidth, "row-width", 1024, "target row width (must match gen)")
 	fs.IntVar(&cfg.FillBuckets, "fill-buckets", 0, "column sets (must match gen)")
+	pairRawSpec := gen.RegisterPairFlags(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,6 +59,13 @@ func Run(args []string) error {
 	}
 	if cfg.FileCols == 0 {
 		cfg.FileCols = cfg.Fields
+	}
+	if cfg.PairCatalog > 0 {
+		spec, err := gen.ParsePairRawDist(*pairRawSpec)
+		if err != nil {
+			return err
+		}
+		cfg.PairRawDist = spec
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -73,6 +81,10 @@ func Run(args []string) error {
 	defer db.Close()
 
 	fails := 0
+
+	if cfg.PairCatalog > 0 {
+		return runPairCheck(db, *table, cfg, *sampleK)
+	}
 
 	// 1. Row count.
 	var cnt uint64

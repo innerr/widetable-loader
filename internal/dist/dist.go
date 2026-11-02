@@ -108,7 +108,16 @@ func httpJSONJob(ctx context.Context, addr, method, path, jobID string, body int
 	if jobID != "" {
 		req.Header.Set("X-Job-ID", jobID)
 	}
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	// Per-request timeout: gen jobs build the full key ordering on first use
+	// (a 1e8-row sort can take a minute), so WT_DIST_HTTP_TIMEOUT lifts the
+	// cap for long first segments; the default stays at 15s.
+	httpTimeout := 15 * time.Second
+	if v := os.Getenv("WT_DIST_HTTP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			httpTimeout = d
+		}
+	}
+	resp, err := (&http.Client{Timeout: httpTimeout}).Do(req)
 	if err != nil {
 		return err
 	}
@@ -124,6 +133,18 @@ func httpJSONJob(ctx context.Context, addr, method, path, jobID string, body int
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+// distTimeout caps how long a dist job may run. The default stays at 30
+// minutes; long-running generations and imports override it with
+// WT_DIST_TIMEOUT (for example "6h").
+func distTimeout() time.Duration {
+	if v := os.Getenv("WT_DIST_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 30 * time.Minute
 }
 
 type taskSet struct {
@@ -278,7 +299,7 @@ func runGen(args []string) (err error) {
 		segments    = fs.Uint64("segments", 0, "total segment count across all nodes")
 		totalRows   = fs.Uint64("total-rows", 0, "total rows across all segments")
 		outDir      = fs.String("out-dir", "", "segment output directory (same local path on every node)")
-		scatter     = fs.String("scatter", "hash32", "key layout: hash32 (customer scatter, default) | blocked | none | mul-hash")
+		scatter     = fs.String("scatter", "hash32", "key layout: hash32 (customer scatter, default) | keyseq (key-ordered segments with disjoint ranges) | blocked | none | mul-hash")
 		gapFactor   = fs.Uint64("gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor")
 		seed        = fs.Uint64("seed", 1, "random seed (identical data for same seed/params)")
 		fields      = fs.Int("fields", 5000, "declared column count")
@@ -288,7 +309,13 @@ func runGen(args []string) (err error) {
 		fill        = fs.Int("fill", 100, "filled declared columns per row")
 		rowWidth    = fs.Int("row-width", 1024, "target row width in bytes")
 		fillBuckets = fs.Int("fill-buckets", 0, ">0: cycle N pre-picked column sets")
+		writeHash   = fs.Bool("write-hash-sidecar", false, "write each segment's content hash next to it, so a later import can skip hashing the dataset")
+		format      = fs.String("format", "csv", "output format: csv | sql (pair mode requires sql)")
+		sqlTable    = fs.String("sql-table", "", "sql format: target table name")
+		sqlMultiRow = fs.Int("sql-multi-row", 1, "sql format: rows per INSERT statement")
+		cfg         gen.Config
 	)
+	pairRawSpec := gen.RegisterPairFlags(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -299,9 +326,31 @@ func runGen(args []string) (err error) {
 	if *segments == 0 || *totalRows == 0 || *outDir == "" {
 		return errors.New("--segments, --total-rows and --out-dir are required")
 	}
-	cfg := gen.Config{TotalRows: *totalRows, Segments: *segments, Scatter: *scatter, GapFactor: *gapFactor,
-		Seed: *seed, Fields: *fields, FileCols: *fileCols, FixedCols: *fixedCols, IndexFields: *indexFlds,
-		Fill: *fill, RowWidth: *rowWidth, FillBuckets: *fillBuckets}
+	cfg.TotalRows = *totalRows
+	cfg.Segments = *segments
+	cfg.Scatter = *scatter
+	cfg.GapFactor = *gapFactor
+	cfg.Seed = *seed
+	cfg.Fields = *fields
+	cfg.FileCols = *fileCols
+	cfg.FixedCols = *fixedCols
+	cfg.IndexFields = *indexFlds
+	cfg.Fill = *fill
+	cfg.RowWidth = *rowWidth
+	cfg.FillBuckets = *fillBuckets
+	cfg.WriteHashSidecar = *writeHash
+	if cfg.PairCatalog > 0 {
+		spec, err := gen.ParsePairRawDist(*pairRawSpec)
+		if err != nil {
+			return err
+		}
+		cfg.PairRawDist = spec
+		if *format == "sql" {
+			if *sqlTable == "" {
+				return errors.New("pair mode requires -sql-table with -format sql")
+			}
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -309,7 +358,13 @@ func runGen(args []string) (err error) {
 	if *segments < n {
 		return fmt.Errorf("segments (%d) < nodes (%d)", *segments, n)
 	}
-	tasks := newTasks(30 * time.Minute)
+	// Segment file extension follows the output format: load treats .sql files
+	// as statements and .csv files as CSV, and clear reads keys from either.
+	segmentExt := ".csv"
+	if *format == "sql" {
+		segmentExt = ".sql"
+	}
+	tasks := newTasks(distTimeout())
 	defer func() { err = errors.Join(err, tasks.close(err != nil)) }()
 
 	type jobInfo struct {
@@ -341,20 +396,33 @@ func runGen(args []string) (err error) {
 			defer wg.Done()
 			for seg := info.from; seg < info.to; seg++ {
 				body := map[string]interface{}{
-					"out":          fmt.Sprintf("%s/seg-%d.csv", *outDir, seg),
-					"segment":      seg,
-					"segments":     *segments,
-					"total_rows":   *totalRows,
-					"scatter":      *scatter,
-					"gap_factor":   *gapFactor,
-					"seed":         *seed,
-					"fields":       *fields,
-					"file_cols":    *fileCols,
-					"fixed_cols":   *fixedCols,
-					"index_fields": *indexFlds,
-					"fill":         *fill,
-					"row_width":    *rowWidth,
-					"fill_buckets": *fillBuckets,
+					"out":                fmt.Sprintf("%s/seg-%d%s", *outDir, seg, segmentExt),
+					"segment":            seg,
+					"segments":           *segments,
+					"total_rows":         *totalRows,
+					"scatter":            *scatter,
+					"gap_factor":         *gapFactor,
+					"seed":               *seed,
+					"fields":             *fields,
+					"file_cols":          *fileCols,
+					"fixed_cols":         *fixedCols,
+					"index_fields":       *indexFlds,
+					"fill":               *fill,
+					"row_width":          *rowWidth,
+					"fill_buckets":       *fillBuckets,
+					"write_hash_sidecar": *writeHash,
+					"format":             *format,
+					"pair_catalog":       cfg.PairCatalog,
+					"pair_fill":          cfg.PairFill,
+					"pair_bucket_rows":   cfg.PairBucketRows,
+					"pair_raw_bytes":     cfg.PairRawDist,
+					"pair_time_start":    cfg.PairTimeStart,
+					"pair_time_span":     cfg.PairTimeSpan,
+					"pair_index":         cfg.PairIndex,
+				}
+				if *format == "sql" {
+					body["sql_table"] = *sqlTable
+					body["sql_multi_row"] = *sqlMultiRow
 				}
 				id, err := tasks.submit(info.node.Addr, "gen", body)
 				if err != nil {
@@ -401,6 +469,7 @@ func runLoad(args []string) (err error) {
 		bulk      = fs.Bool("bulk", false, "enable SST bulk load mode")
 		allowSK   = fs.Bool("allow-sk", true, "with --bulk: allow secondary keys")
 		unsorted  = fs.Bool("allow-unsorted", false, "with --bulk: input rows are unordered")
+		skipHash  = fs.Bool("skip-hash", false, "identify segments by size and mtime instead of hashing content")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -412,7 +481,7 @@ func runLoad(args []string) (err error) {
 	if *dsn == "" || *table == "" || *dir == "" {
 		return errors.New("--dsn, --table and --segments-dir are required")
 	}
-	tasks := newTasks(30 * time.Minute)
+	tasks := newTasks(distTimeout())
 	defer func() { err = errors.Join(err, tasks.close(err != nil)) }()
 
 	ids := make(map[string]string) // addr -> job id
@@ -443,6 +512,7 @@ func runLoad(args []string) (err error) {
 				"bulk":           *bulk,
 				"allow_sk":       *allowSK,
 				"allow_unsorted": *unsorted,
+				"skip_hash":      *skipHash,
 			}
 			id, err := tasks.submit(nd.Addr, "load", body)
 			if err != nil {
@@ -478,7 +548,7 @@ func runLoad(args []string) (err error) {
 		}
 	}
 	start := time.Now()
-	for time.Since(start) < 30*time.Minute {
+	for time.Since(start) < distTimeout() {
 		time.Sleep(2 * time.Second)
 		a := agg{}
 		for _, nd := range sortNodes {
@@ -542,7 +612,7 @@ func runBench(args []string) (err error) {
 		segments  = fs.Uint64("segments", 0, "segment count the data was generated with")
 		totalRows = fs.Uint64("total-rows", 0, "total rows the data was generated with")
 		gapFactor = fs.Uint64("gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor")
-		scatter   = fs.String("scatter", "hash32", "key layout used by gen: hash32 (customer scatter, default) | blocked | none | mul-hash")
+		scatter   = fs.String("scatter", "hash32", "key layout used by gen: hash32 (customer scatter, default) | keyseq (key-ordered segments with disjoint ranges) | blocked | none | mul-hash")
 		fixedCols = fs.Int("fixed-cols", 6, "fixed f-column count (same as gen)")
 		fill      = fs.Int("fill", 200, "columns written per split row (customer ~200 filled)")
 		rowWidth  = fs.Int("row-width", 1024, "target row width in bytes")

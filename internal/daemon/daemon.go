@@ -40,10 +40,19 @@ type GenJob struct {
 	Fill        int    `json:"fill"`
 	RowWidth    int    `json:"row_width"`
 	FillBuckets int    `json:"fill_buckets"`
-	Format      string `json:"format"`           // csv (default) | sql
-	SQLTable    string `json:"sql_table"`        // sql: target table name
-	SQLMultiRow int    `json:"sql_multi_row"`    // sql: rows per INSERT statement
-	SQLUpsert   bool   `json:"sql_upsert"`       // sql: append ON DUPLICATE KEY UPDATE
+	WriteHash   bool   `json:"write_hash_sidecar"` // write each segment's content hash next to it, so a later import can skip hashing the dataset
+	Format      string `json:"format"`             // csv (default) | sql
+	SQLTable    string `json:"sql_table"`          // sql: target table name
+	SQLMultiRow int    `json:"sql_multi_row"`      // sql: rows per INSERT statement
+	SQLUpsert   bool   `json:"sql_upsert"`         // sql: append ON DUPLICATE KEY UPDATE
+
+	PairCatalog    int           `json:"pair_catalog"`
+	PairFill       int           `json:"pair_fill"`
+	PairBucketRows int           `json:"pair_bucket_rows"`
+	PairRawBytes   []gen.PairRaw `json:"pair_raw_bytes"`
+	PairTimeStart  int64         `json:"pair_time_start"`
+	PairTimeSpan   int64         `json:"pair_time_span"`
+	PairIndex      gen.PairIndex `json:"pair_index"`
 }
 
 func (this GenJob) config() gen.Config {
@@ -58,7 +67,12 @@ func (this GenJob) config() gen.Config {
 	return gen.Config{TotalRows: this.TotalRows, Segments: this.Segments, Scatter: scatter,
 		GapFactor: gap, Seed: this.Seed, Fields: this.Fields, FileCols: this.FileCols,
 		FixedCols: this.FixedCols, IndexFields: this.IndexFields, Fill: this.Fill,
-		RowWidth: this.RowWidth, FillBuckets: this.FillBuckets}
+		RowWidth: this.RowWidth, FillBuckets: this.FillBuckets,
+		WriteHashSidecar: this.WriteHash,
+		PairCatalog:      this.PairCatalog, PairFill: this.PairFill, PairBucketRows: this.PairBucketRows,
+		PairRawDist:   this.PairRawBytes,
+		PairTimeStart: this.PairTimeStart, PairTimeSpan: this.PairTimeSpan,
+		PairIndex: this.PairIndex}
 }
 
 type Job struct {
@@ -72,10 +86,11 @@ type Job struct {
 }
 
 type Server struct {
-	mu      sync.Mutex
-	jobs    map[string]*Job
-	wg      sync.WaitGroup
-	closing bool
+	mu         sync.Mutex
+	DiskDevice string
+	jobs       map[string]*Job
+	wg         sync.WaitGroup
+	closing    bool
 }
 
 func (this *Server) handler() http.Handler {
@@ -93,10 +108,14 @@ func (this *Server) handler() http.Handler {
 func Run(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	listen := fs.String("listen", ":9900", "HTTP listen address")
+	diskMount := fs.String("disk-mount", "", "mount point whose block device is reported in host stats (e.g. /data/nvme); empty sums all block devices")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	s := &Server{jobs: map[string]*Job{}}
+	s := &Server{jobs: map[string]*Job{}, DiskDevice: resolveMountDevice(*diskMount)}
+	if *diskMount != "" && s.DiskDevice == "" {
+		fmt.Fprintf(os.Stderr, "warning: %s is not a mount point; disk stats cover all block devices\n", *diskMount)
+	}
 	srv := &http.Server{Addr: *listen, Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -330,7 +349,12 @@ func runGen(ctx context.Context, j GenJob) error {
 	defer os.Remove(stage)
 	w := bufio.NewWriterSize(f, 1<<20)
 	columns := true
-	if j.Format == "sql" {
+	if j.Format == "sql" && j.PairCatalog > 0 {
+		err = g.WriteSQLPairsContext(ctx, w, j.SQLTable, j.SQLMultiRow)
+		columns = false
+	} else if j.Format == "csv" && j.PairCatalog > 0 {
+		err = g.WriteCSVPairsContext(ctx, w)
+	} else if j.Format == "sql" {
 		err = g.WriteSQLContext(ctx, w, j.SQLTable, j.SQLMultiRow, j.SQLUpsert)
 		columns = false
 	} else {
@@ -343,7 +367,11 @@ func runGen(ctx context.Context, j GenJob) error {
 		return err
 	}
 	if columns {
-		if err := os.WriteFile(stage+".columns", []byte(strings.Join(cfg.ColumnNames(), "\n")+"\n"), 0o644); err != nil {
+		names := cfg.ColumnNames()
+		if j.PairCatalog > 0 {
+			names = gen.PairColumnNames(cfg)
+		}
+		if err := os.WriteFile(stage+".columns", []byte(strings.Join(names, "\n")+"\n"), 0o644); err != nil {
 			return err
 		}
 		defer os.Remove(stage + ".columns")
@@ -351,5 +379,5 @@ func runGen(ctx context.Context, j GenJob) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return gen.PublishSegment(stage, j.Out, columns)
+	return gen.PublishSegment(stage, j.Out, columns, j.WriteHash)
 }

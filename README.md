@@ -16,6 +16,29 @@ verify the result.
 | `daemon` | Per-node HTTP job server with cancellation and host statistics |
 | `dist` | Control `gen`, `load`, `bench`, `stats`, and `stop` across node daemons |
 
+## Preparation phase and load phase
+
+Loading (`load` / `dist load`, and any script that measures throughput with
+them) does exactly two things: read the segment files and send their contents
+to the database. It does no one-off preparation work.
+
+Preparation belongs to the preparation phase and is written to disk by `gen`:
+
+| Preparation | Done by | Artifact |
+|---|---|---|
+| Generate rows | `gen` | `seg-N.csv` / `seg-N.sql` |
+| Build the INSERT statements (including multi-row grouping) | `gen -format sql -sql-multi-row N` | `seg-N.sql` |
+| Hash the segment contents (so a resumed load can compare them) | `gen --write-hash-sidecar` | `seg-N.hash` |
+
+Why the split: preparation counted inside the load wall clock lowers the
+reported throughput and puts the hot spots on the load path, hiding the real
+bottleneck. Hashing the dataset by reading it back, and parsing CSV row by row
+to build statements, each measured as a large share of load time.
+
+Both `gen` switches default to off. With them off `load` hashes the segments
+and builds the statements itself -- the behaviour of the earlier rounds, kept so
+those numbers can be reproduced.
+
 ## Build
 
 ```sh

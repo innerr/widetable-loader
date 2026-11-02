@@ -3,10 +3,15 @@ package gen
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/innerr/widetable-loader/internal/genkey"
 )
 
 func TestGenerationDoesNotOverwriteFiles(t *testing.T) {
@@ -246,5 +251,213 @@ func TestParseIndexCols(t *testing.T) {
 	}
 	if _, err := parseIndexCols("c0,abc"); err == nil {
 		t.Fatal("expected error for invalid column")
+	}
+}
+
+// collectKeySeqRows walks one keyseq segment in output order and returns the
+// engine keys (hash, id pairs) plus the seqs that produced them.
+func collectKeySeqRows(t *testing.T, cfg Config, seg uint64) ([][2]uint64, []uint64) {
+	t.Helper()
+	g, err := NewGenerator(cfg, seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys [][2]uint64
+	var seqs []uint64
+	if err := g.forEachSeq(context.Background(), func(seq uint64) error {
+		rec, err := g.Next(seq)
+		if err != nil {
+			return err
+		}
+		id, err := strconv.ParseUint(rec[0], 10, 64)
+		if err != nil {
+			return err
+		}
+		keys = append(keys, [2]uint64{uint64(genkey.EngineHash32(id)), id})
+		seqs = append(seqs, seq)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return keys, seqs
+}
+
+func TestKeySeqScatter(t *testing.T) {
+	cfg := Config{TotalRows: 200, Segments: 4, Scatter: "keyseq",
+		Fields: 5, Fill: 3, IndexFields: 1, RowWidth: 32, Seed: 7}
+	perSeg := cfg.RowsPerSeg()
+
+	var allIDs []uint64
+	for seg := uint64(0); seg < cfg.Segments; seg++ {
+		keys, _ := collectKeySeqRows(t, cfg, seg)
+		ids := make([]uint64, len(keys))
+		for i, k := range keys {
+			ids[i] = k[1]
+		}
+		if uint64(len(ids)) != perSeg {
+			t.Fatalf("segment %d: got %d rows, want %d", seg, len(ids), perSeg)
+		}
+		for i := 1; i < len(keys); i++ {
+			if keys[i-1][0] > keys[i][0] || (keys[i-1][0] == keys[i][0] && keys[i-1][1] >= keys[i][1]) {
+				t.Fatalf("segment %d: engine keys not strictly ascending at row %d", seg, i)
+			}
+		}
+		if seg > 0 {
+			// keyseq's core property: segment engine-key ranges are disjoint and ordered.
+			prev, _ := collectKeySeqRows(t, cfg, seg-1)
+			if less(keys[0], prev[len(prev)-1]) {
+				t.Fatalf("segment %d first key %v not above segment %d last key %v", seg, keys[0], seg-1, prev[len(prev)-1])
+			}
+		}
+		allIDs = append(allIDs, ids...)
+
+		// SegKeyBounds reports the exact id range that was emitted.
+		g, err := NewGenerator(cfg, seg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		minID, maxID := g.SegKeyBounds()
+		if minID != ids[0] || maxID != ids[len(ids)-1] {
+			t.Fatalf("segment %d bounds [%d,%d] do not bracket emitted ids [%d..%d]", seg, minID, maxID, ids[0], ids[len(ids)-1])
+		}
+	}
+
+	// keyseq re-groups the same id set as hash32: same rows, different packing.
+	hashCfg := cfg
+	hashCfg.Scatter = "hash32"
+	var hashIDs []uint64
+	for seg := uint64(0); seg < hashCfg.Segments; seg++ {
+		g, err := NewGenerator(hashCfg, seg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for seq := seg * perSeg; seq < (seg+1)*perSeg; seq++ {
+			rec, err := g.Next(seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := strconv.ParseUint(rec[0], 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hashIDs = append(hashIDs, id)
+		}
+	}
+	slices.Sort(allIDs)
+	slices.Sort(hashIDs)
+	if !slices.Equal(allIDs, hashIDs) {
+		t.Fatal("keyseq id set differs from hash32 id set")
+	}
+
+	// Out-of-order calls are rejected: keyseq rows must arrive in engine key order.
+	g, err := NewGenerator(cfg, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks := g.keySeq
+	if _, err := g.Next(ks.SeqAt(1)); err == nil {
+		t.Fatal("expected out-of-key-order error")
+	}
+}
+
+// less compares two engine keys (hash, id).
+func less(a, b [2]uint64) bool {
+	if a[0] != b[0] {
+		return a[0] < b[0]
+	}
+	return a[1] < b[1]
+}
+
+// TestKeySeqPairSystemValues: pair columns derive from the sequence, so the
+// same sequence renders the same system values under keyseq and hash32; only
+// the row packing differs.
+func TestKeySeqPairSystemValues(t *testing.T) {
+	base := Config{TotalRows: 40, Segments: 2, Scatter: "keyseq",
+		Fields: 1, Fill: 1, IndexFields: 0, RowWidth: 32, Seed: 3,
+		PairCatalog: 10, PairFill: 2, PairRawDist: []PairRaw{{Bytes: 16, Weight: 1.0}}, PairTimeSpan: 259200000,
+		PairIndex: PairIndex{DWDistinct: 4, RowsPerPgID: 5, RowsPerOssPath: 2, RowsPerAnonymousID: 4, RowsPerAttachment: 2, RowsPerPackageName: 5, RowsPerParentID: 4}}
+	probes := []struct{ seg, seq uint64 }{{0, 0}, {0, 1}, {0, 7}, {1, 20}, {1, 39}}
+	systemCols := []string{"dwId", "createTime", "parentId", "dataType", "ms_dataUniqueId"}
+	rendered := map[string]map[uint64]map[string]string{"keyseq": {}, "hash32": {}}
+	for _, scatter := range []string{"keyseq", "hash32"} {
+		gens := map[uint64]*Generator{}
+		for _, seg := range []uint64{0, 1} {
+			cfg := base
+			cfg.Scatter = scatter
+			g, err := NewGenerator(cfg, seg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gens[seg] = g
+		}
+		for _, p := range probes {
+			cols, vals, err := gens[p.seg].NextPairs(p.seq)
+			if err != nil {
+				t.Fatalf("%s seq %d: %v", scatter, p.seq, err)
+			}
+			row := map[string]string{}
+			for i, c := range cols {
+				row[c] = vals[i]
+			}
+			rendered[scatter][p.seq] = row
+		}
+	}
+	for _, p := range probes {
+		for _, sys := range systemCols {
+			a := rendered["keyseq"][p.seq][sys]
+			b := rendered["hash32"][p.seq][sys]
+			if a != b {
+				t.Fatalf("seq %d %s: keyseq %q != hash32 %q", p.seq, sys, a, b)
+			}
+		}
+	}
+}
+
+// A pair-mode generator with per-row random column sets cannot group rows into
+// one multi-row INSERT statement: every row gets a different column list, so
+// the group breaks on the second row and each statement holds exactly one row.
+// The flag used to be accepted and silently do nothing (the 2026-10-26 定稿轮
+// was measured that way), so Run must now refuse the combination instead.
+func TestPairMultiRowRequiresFillBuckets(t *testing.T) {
+	base := []string{"-total-rows", "200", "-segments", "1",
+		"-format", "sql", "-sql-table", "t", "-pair-catalog", "100", "-pair-fill", "10",
+		"-pair-raw-bytes", "96:1"}
+	cases := []struct {
+		name    string
+		flags   []string
+		wantErr string
+	}{
+		{"multi-row without buckets", []string{"-sql-multi-row", "50"}, "fill-buckets"},
+		{"multi-row with buckets", []string{"-sql-multi-row", "50", "-fill-buckets", "1"}, ""},
+		{"single row without buckets", nil, ""},
+		{"bucket-rows without buckets", []string{"-pair-bucket-rows", "50"}, "fill-buckets"},
+		{"bucket-rows with buckets", []string{"-pair-bucket-rows", "50", "-fill-buckets", "1"}, ""},
+		{"upsert in pair mode", []string{"-sql-upsert"}, "upsert"},
+	}
+	for _, c := range cases {
+		// A fresh output path per case: publishing refuses to overwrite.
+		args := append([]string(nil), base...)
+		args = append(args, "-out", t.TempDir()+"/seg")
+		err := Run(append(args, c.flags...))
+		if c.wantErr == "" {
+			if err != nil {
+				t.Errorf("%s: refused a valid combination: %v", c.name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: accepted, want refusal mentioning %q", c.name, c.wantErr)
+		} else if !strings.Contains(err.Error(), c.wantErr) {
+			t.Errorf("%s: error %q does not mention %q", c.name, err, c.wantErr)
+		}
+	}
+}
+
+// -pair-bucket-rows only means something inside pair mode.
+func TestPairBucketRowsOutsidePairMode(t *testing.T) {
+	err := Run([]string{"-total-rows", "200", "-segments", "1", "-out", t.TempDir() + "/seg",
+		"-format", "sql", "-sql-table", "t", "-pair-bucket-rows", "50"})
+	if err == nil || !strings.Contains(err.Error(), "pair-catalog") {
+		t.Fatalf("bucket-rows outside pair mode accepted: %v", err)
 	}
 }
