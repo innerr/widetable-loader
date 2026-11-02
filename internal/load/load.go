@@ -221,13 +221,13 @@ func RunWithProgress(ctx context.Context, p Params, onProgress func(Progress)) e
 			} else {
 				// Generation writes the hash next to the segment; reading it
 				// avoids re-reading the whole dataset before the first row.
-				hash, err = gen.ReadHashSidecar(file)
+				hash, err = gen.ReadHashFile(file)
 				if err == nil && hash == "" {
 					hash, err = fileHash(file)
 					if err == nil && !sqlSegments {
-						var sidecar string
-						sidecar, err = fileHash(file + ".columns")
-						hash += sidecar
+						var columnsHash string
+						columnsHash, err = fileHash(file + ".columns")
+						hash += columnsHash
 					}
 				}
 			}
@@ -429,7 +429,7 @@ func loadSegment(ctx context.Context, p Params, file string) (int64, error) {
 	}
 	cols := strings.Fields(string(b))
 	if len(cols) == 0 || cols[0] != "id" {
-		return 0, errors.New("first sidecar column must be id")
+		return 0, errors.New("first column in the column list must be id")
 	}
 	seen := map[string]bool{}
 	for i, c := range cols {

@@ -26,25 +26,25 @@ import (
 )
 
 type GenJob struct {
-	Out         string `json:"out"`
-	Segment     uint64 `json:"segment"`
-	Segments    uint64 `json:"segments"`
-	TotalRows   uint64 `json:"total_rows"`
-	Scatter     string `json:"scatter"`
-	GapFactor   uint64 `json:"gap_factor"`
-	Seed        uint64 `json:"seed"`
-	Fields      int    `json:"fields"`
-	FileCols    int    `json:"file_cols"`
-	FixedCols   int    `json:"fixed_cols"`
-	IndexFields int    `json:"index_fields"`
-	Fill        int    `json:"fill"`
-	RowWidth    int    `json:"row_width"`
-	FillBuckets int    `json:"fill_buckets"`
-	WriteHash   bool   `json:"write_hash_sidecar"` // write each segment's content hash next to it, so a later import can skip hashing the dataset
-	Format      string `json:"format"`             // csv (default) | sql
-	SQLTable    string `json:"sql_table"`          // sql: target table name
-	SQLMultiRow int    `json:"sql_multi_row"`      // sql: rows per INSERT statement
-	SQLUpsert   bool   `json:"sql_upsert"`         // sql: append ON DUPLICATE KEY UPDATE
+	Out          string `json:"out"`
+	Segment      uint64 `json:"segment"`
+	Segments     uint64 `json:"segments"`
+	TotalRows    uint64 `json:"total_rows"`
+	Scatter      string `json:"scatter"`
+	GapFactor    uint64 `json:"gap_factor"`
+	Seed         uint64 `json:"seed"`
+	Fields       int    `json:"fields"`
+	FileCols     int    `json:"file_cols"`
+	FixedCols    int    `json:"fixed_cols"`
+	IndexFields  int    `json:"index_fields"`
+	Fill         int    `json:"fill"`
+	RowWidth     int    `json:"row_width"`
+	FillBuckets  int    `json:"fill_buckets"`
+	SkipHashFile bool   `json:"skip_hash_file"` // do not write each segment's content hash next to it (only for reproducing rounds measured before hash files)
+	Format       string `json:"format"`         // csv (default) | sql
+	SQLTable     string `json:"sql_table"`      // sql: target table name
+	SQLMultiRow  int    `json:"sql_multi_row"`  // sql: rows per INSERT statement
+	SQLUpsert    bool   `json:"sql_upsert"`     // sql: append ON DUPLICATE KEY UPDATE
 
 	PairCatalog    int           `json:"pair_catalog"`
 	PairFill       int           `json:"pair_fill"`
@@ -68,8 +68,8 @@ func (this GenJob) config() gen.Config {
 		GapFactor: gap, Seed: this.Seed, Fields: this.Fields, FileCols: this.FileCols,
 		FixedCols: this.FixedCols, IndexFields: this.IndexFields, Fill: this.Fill,
 		RowWidth: this.RowWidth, FillBuckets: this.FillBuckets,
-		WriteHashSidecar: this.WriteHash,
-		PairCatalog:      this.PairCatalog, PairFill: this.PairFill, PairBucketRows: this.PairBucketRows,
+		SkipHashFile: this.SkipHashFile,
+		PairCatalog:  this.PairCatalog, PairFill: this.PairFill, PairBucketRows: this.PairBucketRows,
 		PairRawDist:   this.PairRawBytes,
 		PairTimeStart: this.PairTimeStart, PairTimeSpan: this.PairTimeSpan,
 		PairIndex: this.PairIndex}
@@ -379,5 +379,5 @@ func runGen(ctx context.Context, j GenJob) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return gen.PublishSegment(stage, j.Out, columns, j.WriteHash)
+	return gen.PublishSegment(stage, j.Out, columns, !j.SkipHashFile)
 }

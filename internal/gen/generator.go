@@ -50,12 +50,18 @@ type Config struct {
 	PairTimeStart  int64
 	PairTimeSpan   int64
 	PairIndex      PairIndex
+	// Value lengths of the ms (string) and ma (string) families. These are
+	// fixed by the customer row shape rather than sampled, so they are plain
+	// settings instead of part of a distribution.
+	PairMsBytes int
+	PairMaBytes int
 
-	// WriteHashSidecar is off by default: generation stays exactly as it was
-	// and the import hashes the segments itself, which is what earlier
-	// measured rounds did. Turning it on writes each segment's hash next to
-	// it, so an import can skip that pass.
-	WriteHashSidecar bool
+	// SkipHashFile reproduces rounds measured before generation wrote hash
+	// files: the import then hashes every segment itself, which costs a full
+	// read of the dataset before the first row goes in. Off by default because
+	// that pass is pure overhead -- a freshly generated dataset carries its
+	// hashes, and an import reads them instead of re-reading the segments.
+	SkipHashFile bool
 }
 
 // RowsPerSeg is the fixed row count of every segment.
