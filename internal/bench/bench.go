@@ -1,8 +1,8 @@
 // Package bench implements the "bench" subcommand: online read/write
 // workload against loaded data:
 //
-//   - writes: transactions of 2-3 split-row UPSERTs, primary keys drawn
-//     from the gap ranges the generator left between segments;
+//   - writes: transactions updating 2-3 keys with split-column statements,
+//     targeting gap keys in new mode and occupied keys in existing mode;
 //   - reads: uniform point queries on occupied primary key ranges;
 //   - a configurable read/write mix, fixed duration, per-thread stats.
 //
@@ -39,6 +39,7 @@ type Params struct {
 	DurationS int     `json:"duration_s"`
 	WarmupS   int     `json:"warmup_s"`   // unrecorded warmup before the measured window
 	ReadRatio float64 `json:"read_ratio"` // 0..1; rest is writes
+	WriteMode string  `json:"write_mode"` // new: gap keys; existing: occupied keys
 
 	// Key range, same semantics as gen:
 	Segments  uint64 `json:"segments"`
@@ -47,14 +48,14 @@ type Params struct {
 	Scatter   string `json:"scatter"`
 
 	// Row shape, same semantics as gen:
-	FixedCols int    `json:"fixed_cols"` // f1..fN declared before the c columns
-	Fill      int    `json:"fill"`       // columns written per split row (<= file cols)
+	FixedCols int `json:"fixed_cols"` // f1..fN declared before the c columns
+	Fill      int `json:"fill"`       // columns written per split row (<= file cols)
 	// 宽表实际列清单（逗号分隔，不含 id）与其中的数字列。为空时用 gen 生成的
 	// c000001.. 列名，仅适用于声明列形态的表。
-	Columns string `json:"columns"`
-	Numeric string `json:"numeric_columns"`
-	RowWidth  int    `json:"row_width"`
-	Seed      uint64 `json:"seed"`
+	Columns  string `json:"columns"`
+	Numeric  string `json:"numeric_columns"`
+	RowWidth int    `json:"row_width"`
+	Seed     uint64 `json:"seed"`
 }
 
 // Report is one snapshot of a bench run.
@@ -104,6 +105,13 @@ func (this Params) columnList(cfg gen.Config) ([]string, map[string]bool) {
 }
 
 func (this Params) Validate() error {
+	writeMode := this.WriteMode
+	if writeMode == "" {
+		writeMode = "new"
+	}
+	if writeMode != "new" && writeMode != "existing" {
+		return fmt.Errorf("unknown write-mode %q (new | existing)", this.WriteMode)
+	}
 	if this.DSN == "" || this.Table == "" || this.Threads < 1 || this.DurationS < 1 ||
 		this.WarmupS < 0 || this.WarmupS >= this.DurationS ||
 		math.IsNaN(this.ReadRatio) || this.ReadRatio < 0 || this.ReadRatio > 1 || this.Fill < 1 {
@@ -113,6 +121,10 @@ func (this Params) Validate() error {
 		GapFactor: this.GapFactor, Fields: this.Fill, Fill: this.Fill, FixedCols: this.FixedCols, RowWidth: this.RowWidth}
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+	if writeMode == "existing" {
+		declared, _ := this.columnList(cfg)
+		return validateExistingColumns(declared)
 	}
 	if this.ReadRatio < 1 {
 		if this.GapFactor <= 1 || this.TotalRows > uint64(1<<63-1)/this.GapFactor {
@@ -134,7 +146,9 @@ func Run(args []string) error {
 	fs.IntVar(&p.Threads, "threads", 16, "concurrent client threads")
 	fs.IntVar(&p.DurationS, "duration", 600, "run duration in seconds")
 	fs.IntVar(&p.WarmupS, "warmup", 0, "unrecorded warmup seconds before the measured window")
-	fs.Float64Var(&p.ReadRatio, "read-ratio", 0.5, "read fraction 0..1 (rest is split-row UPSERT writes)")
+	fs.Float64Var(&p.ReadRatio, "read-ratio", 0.5, "read fraction 0..1 (rest is writes)")
+	fs.StringVar(&p.WriteMode, "write-mode", "new", "write target: new gap keys | existing occupied keys")
+	fs.StringVar(&p.Columns, "columns", "", "comma-separated declared columns to write, excluding id")
 	fs.Uint64Var(&p.Segments, "segments", 0, "segment count the data was generated with")
 	fs.Uint64Var(&p.TotalRows, "total-rows", 0, "total rows the data was generated with")
 	fs.Uint64Var(&p.GapFactor, "gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor")
@@ -145,6 +159,15 @@ func Run(args []string) error {
 	fs.Uint64Var(&p.Seed, "seed", 1, "random seed")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	gapFactorSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "gap-factor" {
+			gapFactorSet = true
+		}
+	})
+	if p.WriteMode == "existing" && gapFactorSet {
+		return fmt.Errorf("-gap-factor has no effect with -write-mode existing")
 	}
 	if p.DSN == "" || p.Table == "" {
 		return fmt.Errorf("--dsn and --table are required")
@@ -301,10 +324,10 @@ func report(reads, writes, errs, readBytes, writeRows, writeStmts *int64, measur
 		el = 0
 	}
 	r := Report{
-		ElapsedS:  el,
-		Reads:     atomic.LoadInt64(reads),
-		Writes:    atomic.LoadInt64(writes),
-		Errors:    atomic.LoadInt64(errs),
+		ElapsedS:   el,
+		Reads:      atomic.LoadInt64(reads),
+		Writes:     atomic.LoadInt64(writes),
+		Errors:     atomic.LoadInt64(errs),
 		ReadBytes:  atomic.LoadInt64(readBytes),
 		WriteRows:  atomic.LoadInt64(writeRows),
 		WriteStmts: atomic.LoadInt64(writeStmts),
@@ -363,8 +386,15 @@ func runThread(ctx context.Context, p Params, cfg gen.Config, rps, gapLo, gapHi 
 			}
 		} else {
 			t0 := time.Now()
-			rows, statements, err := splitWrite(ctx, db, p.Table, declared, numeric, gapLo, gapHi,
-				layouts, rng, cfg, errs)
+			var rows, statements int
+			var err error
+			if p.WriteMode == "existing" {
+				rows, statements, err = existingWrite(ctx, db, p.Table, declared, numeric, rps,
+					layouts, rng, cfg, errs)
+			} else {
+				rows, statements, err = splitWrite(ctx, db, p.Table, declared, numeric, gapLo, gapHi,
+					layouts, rng, cfg, errs)
+			}
 			if err != nil {
 				return err
 			}
@@ -422,8 +452,106 @@ func pointRead(ctx context.Context, db *sql.DB, table string, rps uint64, layout
 	return size, nil
 }
 
+const (
+	largeJSONColumn1    = "xx_long_1_raw"
+	largeJSONColumn2    = "xx_long_2_raw"
+	largeJSONValueBytes = 51200
+)
+
+type writeStatement struct {
+	query   string
+	args    []any
+	columns []string
+}
+
+func validateExistingColumns(declared []string) error {
+	found := make(map[string]bool, 2)
+	for _, name := range declared {
+		if name == largeJSONColumn1 || name == largeJSONColumn2 {
+			found[name] = true
+		}
+	}
+	if len(found) != 2 {
+		return fmt.Errorf("-write-mode existing requires -columns to include %s and %s; the case must contain both large JSON columns",
+			largeJSONColumn1, largeJSONColumn2)
+	}
+	if len(declared) < 3 {
+		return fmt.Errorf("-write-mode existing requires at least one small column besides %s and %s",
+			largeJSONColumn1, largeJSONColumn2)
+	}
+	return nil
+}
+
+// buildWriteStatements builds 2-3 non-overlapping column subsets for one key.
+// Existing-key writes put both large JSON columns in the first subset.
+func buildWriteStatements(table string, id uint64, declared []string, numeric map[string]bool,
+	rng *rand.Rand, cfg gen.Config, writeMode string) ([]writeStatement, error) {
+	keyword := "INSERT"
+	existing := writeMode == "existing"
+	if existing {
+		keyword = "UPSERT"
+		if err := validateExistingColumns(declared); err != nil {
+			return nil, err
+		}
+	} else if writeMode != "new" {
+		return nil, fmt.Errorf("unknown write-mode %q (new | existing)", writeMode)
+	}
+
+	perRow := 2 + rng.Intn(2)
+	perm := rng.Perm(len(declared))
+	if existing {
+		forced := make([]int, 0, 2)
+		for _, name := range []string{largeJSONColumn1, largeJSONColumn2} {
+			for _, index := range perm {
+				if declared[index] == name {
+					forced = append(forced, index)
+					break
+				}
+			}
+		}
+		remaining := make([]int, 0, len(perm)-2)
+		for _, index := range perm {
+			if declared[index] != largeJSONColumn1 && declared[index] != largeJSONColumn2 {
+				remaining = append(remaining, index)
+			}
+		}
+		perm = append(forced, remaining...)
+	}
+
+	perStatement := (len(perm) + perRow - 1) / perRow
+	statements := make([]writeStatement, 0, perRow)
+	for k := 0; k < perRow; k++ {
+		lo := k * perStatement
+		if lo >= len(perm) {
+			break
+		}
+		hi := min(lo+perStatement, len(perm))
+		subset := perm[lo:hi]
+		colNames := make([]string, 0, len(subset)+1)
+		colNames = append(colNames, "id")
+		placeholders := make([]string, 0, len(subset)+1)
+		placeholders = append(placeholders, "?")
+		statement := writeStatement{
+			args:    make([]any, 0, len(subset)+1),
+			columns: make([]string, 0, len(subset)),
+		}
+		statement.args = append(statement.args, id)
+		for _, ci := range subset {
+			name := declared[ci]
+			colNames = append(colNames, name)
+			placeholders = append(placeholders, "?")
+			statement.columns = append(statement.columns, name)
+			statement.args = append(statement.args, benchColumn(name, numeric[name], rng, cfg, len(subset)))
+		}
+		statement.query = fmt.Sprintf("%s INTO %s (%s) VALUES (%s)", keyword,
+			sqlutil.QuoteIdentifier(table), strings.Join(colNames, ","), strings.Join(placeholders, ","))
+		statements = append(statements, statement)
+	}
+	return statements, nil
+}
+
 // splitWrite: one transaction writing 2-3 new rows into gap keys. Each row is
-// written by 2-3 UPSERT statements that split its column subset, so a row costs
+// written by 2-3 INSERT statements that split its column subset, so a row costs
 // several statements but only one row in the table.
 func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string, numeric map[string]bool,
 	gapLo, gapHi uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
@@ -434,7 +562,7 @@ func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rowsPerTx := 2 + int(rng.Intn(2)) // 2 or 3 new rows per event
+	rowsPerTx := 2 + rng.Intn(2)
 	for r := 0; r < rowsPerTx; r++ {
 		seg := rng.Uint64() % cfg.Segments
 		seq := gapLo + rng.Uint64()%(gapHi-gapLo)
@@ -442,49 +570,55 @@ func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string
 			seq = seg*cfg.RowsPerSeg() + cfg.RowsPerSeg() + rng.Uint64()%(cfg.Stride()-cfg.RowsPerSeg())
 		}
 		id := layouts[seg].ID(seq)
-		perRow := 2 + int(rng.Intn(2)) // 2 or 3 statements per row
-		perm := rng.Perm(len(declared))
-		perStatement := (len(perm) + perRow - 1) / perRow
-		wrote := false
-		for k := 0; k < perRow; k++ {
-			lo := k * perStatement
-			if lo >= len(perm) {
-				break
-			}
-			hi := lo + perStatement
-			if hi > len(perm) {
-				hi = len(perm)
-			}
-			subset := perm[lo:hi]
-			if len(subset) == 0 {
-				continue
-			}
-			colNames := make([]string, 0, len(subset)+1)
-			colNames = append(colNames, "id")
-			placeholders := make([]string, 0, len(subset)+1)
-			placeholders = append(placeholders, "?")
-			args := make([]interface{}, 0, len(subset)+1)
-			args = append(args, id)
-			for _, ci := range subset {
-				name := declared[ci]
-				colNames = append(colNames, name)
-				placeholders = append(placeholders, "?")
-				args = append(args, benchColumn(name, numeric[name], rng, cfg, len(subset)))
-			}
+		built, err := buildWriteStatements(table, id, declared, numeric, rng, cfg, "new")
+		if err != nil {
+			return rows, statements, err
+		}
+		for _, statement := range built {
 			// 宽表不支持 ON DUPLICATE KEY UPDATE；撞主键的 INSERT 本身就是
 			// 按列合并的 upsert，正是客户 partial upsert 的语义。
-			sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-				sqlutil.QuoteIdentifier(table), strings.Join(colNames, ","),
-				strings.Join(placeholders, ","))
-			if _, err := tx.ExecContext(ctx, sql, args...); err != nil {
+			if _, err := tx.ExecContext(ctx, statement.query, statement.args...); err != nil {
 				return rows, statements, workloadError(ctx, errs, "split upsert", err)
 			}
-			wrote = true
 			statements++
 		}
-		if wrote {
+		if len(built) > 0 {
 			rows++
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return rows, statements, workloadError(ctx, errs, "commit", err)
+	}
+	return rows, statements, nil
+}
+
+// existingWrite updates 2-3 occupied keys per transaction. Each key receives
+// 2-3 UPSERT statements, including one statement with both large JSON columns.
+func existingWrite(ctx context.Context, db *sql.DB, table string, declared []string, numeric map[string]bool,
+	rps uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
+	errs *int64) (rows int, statements int, err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, workloadError(ctx, errs, "begin", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rowsPerTx := 2 + rng.Intn(2)
+	for r := 0; r < rowsPerTx; r++ {
+		seg := rng.Uint64() % cfg.Segments
+		seq := seg*rps + rng.Uint64()%rps
+		id := layouts[seg].ID(seq)
+		built, err := buildWriteStatements(table, id, declared, numeric, rng, cfg, "existing")
+		if err != nil {
+			return rows, statements, err
+		}
+		for _, statement := range built {
+			if _, err := tx.ExecContext(ctx, statement.query, statement.args...); err != nil {
+				return rows, statements, workloadError(ctx, errs, "existing upsert", err)
+			}
+			statements++
+		}
+		rows++
 	}
 	if err := tx.Commit(); err != nil {
 		return rows, statements, workloadError(ctx, errs, "commit", err)
@@ -500,13 +634,48 @@ func workloadError(ctx context.Context, errs *int64, action string, err error) e
 	return fmt.Errorf("%s: %w", action, err)
 }
 
-// benchColumn：数字列给整数，其余给字符串（宽表动态列只接受字符串，
-// 字符串长度按目标行宽摊到本行的列数上）。
+// benchColumn builds one column value. The row width is carried by the two
+// large JSON columns, so every other column gets a short value that fits its
+// declared width: a numeric column gets an integer, a named customer column
+// gets a short string, and a dynamic value/raw pair gets the shape gen writes.
+// Spreading RowWidth over all columns would overflow VARCHAR and bigint
+// columns on the customer table (seen with --row-width 120000).
 func benchColumn(name string, numeric bool, rng *rand.Rand, cfg gen.Config, count int) any {
-	if !numeric {
-		return benchValue(rng, cfg.RowWidth, count)
+	if name == largeJSONColumn1 || name == largeJSONColumn2 {
+		return benchLargeJSONValue(rng)
 	}
-	return int64(1700000000) + rng.Int63n(1000000)
+	if numeric || name == "pgId" || name == "parentId" || name == "dwId" ||
+		name == "createTime" || name == "updateTime" || name == "mi_isDeleted" ||
+		strings.HasSuffix(name, "_val") && strings.HasPrefix(name, "mi_") {
+		return int64(1700000000) + rng.Int63n(1000000)
+	}
+	if strings.HasSuffix(name, "_raw") {
+		return fmt.Sprintf(`{"v":%d,"p":"%s"}`, rng.Intn(1000000), benchRandomString(rng, 24))
+	}
+	if strings.HasSuffix(name, "_val") {
+		switch {
+		case strings.HasPrefix(name, "md_"):
+			return fmt.Sprintf("%.2f", rng.Float64()*1000)
+		case strings.HasPrefix(name, "mb_"):
+			return "true"
+		default:
+			return benchRandomString(rng, 18)
+		}
+	}
+	// Named customer columns: short values that fit varchar(16..128).
+	if strings.HasPrefix(name, "dataType") || strings.HasPrefix(name, "parentDataType") {
+		return benchRandomString(rng, 4)
+	}
+	if strings.HasPrefix(name, "ms_") {
+		return benchRandomString(rng, 12)
+	}
+	return benchValue(rng, 32, count)
+}
+
+func benchLargeJSONValue(rng *rand.Rand) string {
+	head := fmt.Sprintf(`{"v":%d,"p":"`, rng.Intn(1000000))
+	tail := `"}`
+	return head + benchRandomString(rng, largeJSONValueBytes-len(head)-len(tail)) + tail
 }
 
 func benchColumnValue(rng *rand.Rand, idx int, cfg gen.Config, count int) any {
@@ -537,11 +706,15 @@ func benchColumnValue(rng *rand.Rand, idx int, cfg gen.Config, count int) any {
 // benchValue returns a plausible column value sized for the target row
 // width: strings dominate, ints/doubles for variety like gen does.
 func benchValue(rng *rand.Rand, rowWidth, colsInRow int) interface{} {
-	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	n := rowWidth / (colsInRow * 2) // utf8mb3: ~1 byte per char
 	if n < 4 {
 		n = 4
 	}
+	return benchRandomString(rng, n)
+}
+
+func benchRandomString(rng *rand.Rand, n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
 	for i := range b {
 		b[i] = letters[rng.Intn(len(letters))]

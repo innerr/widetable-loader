@@ -33,10 +33,12 @@ import (
 func Run(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var (
-		dsn     = fs.String("dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:port)/db")
-		table   = fs.String("table", "", "target table")
-		cfg     gen.Config
-		sampleK = fs.Int("sample-per-segment", 8, "sampled rows per segment")
+		dsn         = fs.String("dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:port)/db")
+		table       = fs.String("table", "", "target table")
+		cfg         gen.Config
+		sampleK     = fs.Int("sample-per-segment", 8, "sampled rows per segment")
+		sampleHead  = fs.Int("sample-head", 0, "limits regeneration work; sampled rows come from the head of each segment (0 = unlimited)")
+		maxSegments = fs.Int("max-segments", 0, "maximum segments to check from the start (0 = all segments)")
 	)
 	fs.Uint64Var(&cfg.TotalRows, "total-rows", 0, "total rows across all segments (must match gen)")
 	fs.Uint64Var(&cfg.Segments, "segments", 8, "total segment count (must match gen)")
@@ -50,10 +52,11 @@ func Run(args []string) error {
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (must match gen)")
 	fs.IntVar(&cfg.RowWidth, "row-width", 1024, "target row width (must match gen)")
 	fs.IntVar(&cfg.FillBuckets, "fill-buckets", 0, "column sets (must match gen)")
-	pairRawSpec := gen.RegisterPairFlags(fs, &cfg)
+	pairRawSpec, pairExtraRawSpec := gen.RegisterPairFlags(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	cfg.RecordExplicitFlags(fs)
 	if *dsn == "" || *table == "" || cfg.TotalRows == 0 {
 		return fmt.Errorf("--dsn, --table and --total-rows are required")
 	}
@@ -66,12 +69,23 @@ func Run(args []string) error {
 			return err
 		}
 		cfg.PairRawDist = spec
+		extraRaw, err := gen.ParsePairExtraRaw(*pairExtraRawSpec)
+		if err != nil {
+			return err
+		}
+		cfg.PairExtraRaw = extraRaw
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	if *sampleK < 1 {
 		return fmt.Errorf("sample-per-segment must be positive")
+	}
+	if *sampleHead < 0 {
+		return fmt.Errorf("sample-head must not be negative")
+	}
+	if *maxSegments < 0 {
+		return fmt.Errorf("max-segments must not be negative")
 	}
 
 	db, err := sql.Open("mysql", *dsn)
@@ -83,7 +97,7 @@ func Run(args []string) error {
 	fails := 0
 
 	if cfg.PairCatalog > 0 {
-		return runPairCheck(db, *table, cfg, *sampleK)
+		return runPairCheck(db, *table, cfg, *sampleK, *sampleHead, *maxSegments)
 	}
 
 	// 1. Row count.
@@ -102,29 +116,14 @@ func Run(args []string) error {
 	colList := "`" + strings.Join(colNames, "`,`") + "`"
 
 	// 2+3. Per-segment sampling.
-	for seg := uint64(0); seg < cfg.Segments; seg++ {
+	for seg := uint64(0); seg < segmentLimit(cfg.Segments, *maxSegments); seg++ {
 		g, err := gen.NewGenerator(cfg, seg)
 		if err != nil {
 			return err
 		}
 		row0 := seg * cfg.RowsPerSeg()
-		rowsPerSeg := cfg.RowsPerSeg()
-
-		// Deterministic distinct sample offsets within the segment.
-		srng := rand.New(rand.NewSource(int64(cfg.Seed*7919 + seg)))
-		k := *sampleK
-		if uint64(k) > rowsPerSeg {
-			k = int(rowsPerSeg)
-		}
-		offSet := map[uint64]struct{}{}
-		for len(offSet) < k {
-			offSet[uint64(srng.Int63n(int64(rowsPerSeg)))] = struct{}{}
-		}
-		offs := make([]uint64, 0, k)
-		for o := range offSet {
-			offs = append(offs, o)
-		}
-		sort.Slice(offs, func(i, j int) bool { return offs[i] < offs[j] })
+		offs := sampleOffsets(cfg.RowsPerSeg(), cfg.Seed, seg, *sampleK, *sampleHead)
+		k := len(offs)
 
 		// Single pass: advance the generator to each sampled row.
 		expected := map[uint64][]string{} // offset -> record copy
@@ -163,6 +162,37 @@ func Run(args []string) error {
 	}
 	fmt.Println("check PASSED")
 	return nil
+}
+
+func segmentLimit(segments uint64, maxSegments int) uint64 {
+	if maxSegments > 0 && uint64(maxSegments) < segments {
+		return uint64(maxSegments)
+	}
+	return segments
+}
+
+func sampleOffsets(rowsPerSeg, seed, seg uint64, sampleK, sampleHead int) []uint64 {
+	sampleRange := rowsPerSeg
+	if sampleHead > 0 && uint64(sampleHead) < sampleRange {
+		sampleRange = uint64(sampleHead)
+	}
+	k := sampleK
+	if uint64(k) > sampleRange {
+		k = int(sampleRange)
+	}
+
+	// Deterministic distinct sample offsets within the permitted range.
+	srng := rand.New(rand.NewSource(int64(seed*7919 + seg)))
+	offSet := map[uint64]struct{}{}
+	for len(offSet) < k {
+		offSet[uint64(srng.Int63n(int64(sampleRange)))] = struct{}{}
+	}
+	offs := make([]uint64, 0, k)
+	for off := range offSet {
+		offs = append(offs, off)
+	}
+	sort.Slice(offs, func(i, j int) bool { return offs[i] < offs[j] })
+	return offs
 }
 
 // checkRow compares one expected record against the stored row.

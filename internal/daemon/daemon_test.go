@@ -8,8 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/innerr/widetable-loader/internal/gen"
 )
 
 func TestAPIAndConcurrentPolling(t *testing.T) {
@@ -80,6 +83,65 @@ func TestAPIAndConcurrentPolling(t *testing.T) {
 		if resp.StatusCode != 400 {
 			t.Fatal("invalid sampling interval accepted:", sec)
 		}
+	}
+}
+
+func TestGenJobUsesCommonPairValidation(t *testing.T) {
+	validJob := func() GenJob {
+		return GenJob{TotalRows: 10, Segments: 1, Scatter: "hash32", Format: "sql", SQLTable: "t", SQLMultiRow: 1,
+			PairCatalog: 100, PairFill: 10, PairRawBytes: []gen.PairRaw{{Bytes: 96, Weight: 1}}, PairTimeSpan: 1,
+			PairIndex: gen.PairIndex{DWDistinct: 100, RowsPerPgID: 250, RowsPerOssPath: 4,
+				RowsPerAnonymousID: 1000, RowsPerAttachment: 4, RowsPerPackageName: 100, RowsPerParentID: 1000}}
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*GenJob)
+		want   string
+	}{
+		{name: "fields", mutate: func(j *GenJob) { j.Fields = 1 }, want: "fields"},
+		{name: "file cols", mutate: func(j *GenJob) { j.FileCols = 1 }, want: "file-cols"},
+		{name: "fixed cols", mutate: func(j *GenJob) { j.FixedCols = 1 }, want: "fixed-cols"},
+		{name: "index fields", mutate: func(j *GenJob) { j.IndexFields = 1 }, want: "index-fields"},
+		{name: "fill", mutate: func(j *GenJob) { j.Fill = 1 }, want: "fill"},
+		{name: "row width", mutate: func(j *GenJob) { j.RowWidth = 1 }, want: "row-width"},
+		{name: "gap outside blocked", mutate: func(j *GenJob) { j.GapFactor = 5 }, want: "gap-factor"},
+		{name: "multi row without buckets", mutate: func(j *GenJob) { j.SQLMultiRow = 50 }, want: "fill-buckets"},
+		{name: "bucket rows without buckets", mutate: func(j *GenJob) { j.PairBucketRows = 50 }, want: "fill-buckets"},
+		{name: "upsert", mutate: func(j *GenJob) { j.SQLUpsert = true }, want: "sql-upsert"},
+		{name: "max row bytes is mapped", mutate: func(j *GenJob) { j.PairMaxRowBytes = 1 }, want: "pair-max-row-bytes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			job := validJob()
+			test.mutate(&job)
+			if _, err := gen.NewGenerator(job.config(), 0); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("got error %v, want one mentioning %q", err, test.want)
+			}
+		})
+	}
+	if _, err := gen.NewGenerator(validJob().config(), 0); err != nil {
+		t.Fatalf("zero-valued generic JSON fields must not count as explicit: %v", err)
+	}
+}
+
+func TestGenJobUsesCommonSQLValidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*GenJob)
+		want   string
+	}{
+		{name: "table with csv", mutate: func(j *GenJob) { j.SQLTable = "t" }, want: "format sql"},
+		{name: "multi row with csv", mutate: func(j *GenJob) { j.SQLMultiRow = 2 }, want: "format sql"},
+		{name: "upsert with csv", mutate: func(j *GenJob) { j.SQLUpsert = true }, want: "format sql"},
+		{name: "sql without table", mutate: func(j *GenJob) { j.Format = "sql" }, want: "sql-table"},
+		{name: "bucket rows without pair", mutate: func(j *GenJob) { j.PairBucketRows = 2 }, want: "pair-catalog"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			job := GenJob{TotalRows: 2, Segments: 1, Scatter: "none", Format: "csv", SQLMultiRow: 1, Fields: 2, Fill: 1}
+			test.mutate(&job)
+			if _, err := gen.NewGenerator(job.config(), 0); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("got error %v, want one mentioning %q", err, test.want)
+			}
+		})
 	}
 }
 

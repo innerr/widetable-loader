@@ -9,8 +9,6 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
-	"math/rand"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -18,7 +16,7 @@ import (
 	"github.com/innerr/widetable-loader/internal/sqlutil"
 )
 
-func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK int) error {
+func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK, sampleHead, maxSegments int) error {
 	fails := 0
 	var cnt uint64
 	if err := db.QueryRow("SELECT COUNT(*) FROM " + sqlutil.QuoteIdentifier(table)).Scan(&cnt); err != nil {
@@ -30,36 +28,25 @@ func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK int) error {
 	} else {
 		fmt.Printf("PASS row count: %d\n", cnt)
 	}
-	for seg := uint64(0); seg < cfg.Segments; seg++ {
+	for seg := uint64(0); seg < segmentLimit(cfg.Segments, maxSegments); seg++ {
 		g, err := gen.NewGenerator(cfg, seg)
 		if err != nil {
 			return err
 		}
 		row0 := seg * cfg.RowsPerSeg()
-		rowsPerSeg := cfg.RowsPerSeg()
-		srng := rand.New(rand.NewSource(int64(cfg.Seed*7919 + seg)))
-		k := sampleK
-		if uint64(k) > rowsPerSeg {
-			k = int(rowsPerSeg)
-		}
-		seen := map[uint64]struct{}{}
-		for len(seen) < k {
-			seen[uint64(srng.Int63n(int64(rowsPerSeg)))] = struct{}{}
-		}
-		offs := make([]uint64, 0, k)
-		for off := range seen {
-			offs = append(offs, off)
-		}
-		sort.Slice(offs, func(i, j int) bool { return offs[i] < offs[j] })
+		offs := sampleOffsets(cfg.RowsPerSeg(), cfg.Seed, seg, sampleK, sampleHead)
+		k := len(offs)
 		// One pass over the segment: the generator advances its column picker
 		// per row, so skipping rows here would desynchronize it from the file
-		// that was imported.
+		// that was imported. SeqAt maps the row rank to the source sequence the
+		// writer used (key order for keyseq), so the checker consumes the RNG in
+		// exactly the same order as the writer and rebuilds identical values.
 		type pair struct{ cols, vals []string }
 		expected := map[uint64]pair{}
 		next := uint64(0)
 		for _, off := range offs {
 			for ; next <= off; next++ {
-				cols, vals, err := g.NextPairs(row0 + next)
+				cols, vals, err := g.NextPairs(g.SeqAt(row0 + next))
 				if err != nil {
 					return err
 				}

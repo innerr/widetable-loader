@@ -45,6 +45,41 @@ func TestCurrentGenerationIgnoresOldFailures(t *testing.T) {
 	}
 }
 
+func TestGenPairPayload(t *testing.T) {
+	var body map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/gen", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		json.NewEncoder(w).Encode(map[string]string{"id": r.Header.Get("X-Job-ID")})
+	})
+	mux.HandleFunc("/api/job/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"finished": true})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	err := runGen([]string{"-nodes", strings.TrimPrefix(server.URL, "http://"),
+		"-segments", "1", "-total-rows", "10", "-out-dir", t.TempDir(), "-format", "sql", "-sql-table", "t",
+		"-pair-catalog", "100", "-pair-fill", "10", "-pair-raw-bytes", "96:1",
+		"-pair-extra-raw", "xx_long_raw:51200", "-pair-max-row-bytes", "200000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := body["pair_max_row_bytes"]; got != float64(200000) {
+		t.Fatalf("pair_max_row_bytes = %v, want 200000", got)
+	}
+	extra, ok := body["pair_extra_raw"].([]any)
+	if !ok || len(extra) != 1 || extra[0].(map[string]any)["name"] != "xx_long_raw" {
+		t.Fatalf("pair_extra_raw was not forwarded: %v", body["pair_extra_raw"])
+	}
+	for _, name := range []string{"fields", "file_cols", "fixed_cols", "index_fields", "fill", "row_width", "gap_factor"} {
+		if _, exists := body[name]; exists {
+			t.Errorf("pair request contains default %s, which daemon must treat as explicit", name)
+		}
+	}
+}
+
 func TestBenchFailureIsReturned(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/bench", func(w http.ResponseWriter, r *http.Request) {

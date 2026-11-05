@@ -15,6 +15,7 @@ package gen
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -41,15 +42,28 @@ type Config struct {
 	RowWidth    int
 	FillBuckets int // >0: cycle through this many pre-picked column sets instead of per-row random
 
+	// Output settings are validated here so direct and daemon generation apply
+	// the same rules. Format is empty for callers that only regenerate rows.
+	Format      string
+	SQLTable    string
+	SQLMultiRow int
+	SQLUpsert   bool
+
+	// ExplicitFlags contains flags explicitly supplied by the caller. The
+	// daemon populates it from nonzero JSON fields that have no FlagSet.
+	ExplicitFlags map[string]bool
+
 	// Pair mode (customer field pairs). PairCatalog > 0 switches the row model
 	// to sparse field pairs; see pairs.go.
-	PairCatalog    int
-	PairFill       int
-	PairBucketRows int // pair mode: rows per bucket before cycling to the next column set (>1 enables CSV multi-row grouping)
-	PairRawDist    []PairRaw
-	PairTimeStart  int64
-	PairTimeSpan   int64
-	PairIndex      PairIndex
+	PairCatalog     int
+	PairFill        int
+	PairBucketRows  int // pair mode: rows per bucket before cycling to the next column set (>1 enables CSV multi-row grouping)
+	PairRawDist     []PairRaw
+	PairExtraRaw    []PairExtraRaw
+	PairMaxRowBytes int // maximum estimated pair row bytes including extra raw columns; 0 uses the txn_max_entry_size-derived default
+	PairTimeStart   int64
+	PairTimeSpan    int64
+	PairIndex       PairIndex
 	// Value lengths of the ms (string) and ma (string) families. These are
 	// fixed by the customer row shape rather than sampled, so they are plain
 	// settings instead of part of a distribution.
@@ -62,6 +76,15 @@ type Config struct {
 	// that pass is pure overhead -- a freshly generated dataset carries its
 	// hashes, and an import reads them instead of re-reading the segments.
 	SkipHashFile bool
+}
+
+// RecordExplicitFlags remembers which flags were supplied rather than left at
+// their defaults. Validation uses this to reject ignored pair-mode settings.
+func (this *Config) RecordExplicitFlags(fs *flag.FlagSet) {
+	this.ExplicitFlags = make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		this.ExplicitFlags[f.Name] = true
+	})
 }
 
 // RowsPerSeg is the fixed row count of every segment.
@@ -202,18 +225,63 @@ func NewGenerator(cfg Config, segment uint64) (*Generator, error) {
 	}
 	if cfg.PairCatalog > 0 {
 		g.pair = newPairGen(cfg)
-		g.pairCols = make([]string, 0, 1+len(pairSystemColumns)+len(pairIndexColumns)+2*cfg.PairFill)
+		g.pairCols = make([]string, 0, 1+len(pairSystemColumns)+len(pairIndexColumns)+len(cfg.PairExtraRaw)+2*cfg.PairFill)
 		g.pairVals = make([]string, 0, cap(g.pairCols))
 	}
 	return g, nil
 }
 
-// Validate checks the sequence domain and dimensions before allocation.
+// Validate checks output options, the sequence domain and dimensions before allocation.
 func (this Config) Validate() error {
+	if this.ExplicitFlags["gap-factor"] && this.Scatter != "blocked" {
+		return fmt.Errorf("-gap-factor has no effect with -scatter %q; it requires -scatter blocked", this.Scatter)
+	}
+	if this.PairCatalog > 0 {
+		for _, name := range []string{"fields", "file-cols", "fixed-cols", "index-fields", "fill", "row-width"} {
+			if this.ExplicitFlags[name] {
+				return fmt.Errorf("-%s has no effect in pair mode: pair mode does not read -fields, -file-cols, -fixed-cols, -index-fields, -fill or -row-width", name)
+			}
+		}
+	}
+	if this.Format != "" {
+		if this.Format != "csv" && this.Format != "sql" {
+			return fmt.Errorf("unknown format %q (csv | sql)", this.Format)
+		}
+		sql := this.Format == "sql"
+		if !sql && (this.SQLTable != "" || this.SQLMultiRow != 1 || this.SQLUpsert) {
+			return fmt.Errorf("--sql-table/--sql-multi-row/--sql-upsert require -format sql")
+		}
+		if sql && this.SQLTable == "" {
+			return fmt.Errorf("-format sql requires --sql-table")
+		}
+		if this.SQLMultiRow < 1 {
+			return fmt.Errorf("--sql-multi-row must be >= 1")
+		}
+	}
 	if this.PairCatalog > 0 {
 		if err := validatePairConfig(this); err != nil {
 			return err
 		}
+		// A multi-row INSERT has one column list. Without buckets, per-row
+		// random column sets break every group on its second row.
+		if this.SQLMultiRow > 1 && this.FillBuckets == 0 {
+			return fmt.Errorf("-sql-multi-row %d has no effect in pair mode without -fill-buckets: "+
+				"per-row random column sets break the group on the second row, so every statement holds one row; "+
+				"set -fill-buckets 1 to actually group %d rows per statement, or drop -sql-multi-row",
+				this.SQLMultiRow, this.SQLMultiRow)
+		}
+		if this.PairBucketRows != 0 && this.FillBuckets == 0 {
+			return fmt.Errorf("-pair-bucket-rows %d has no effect without -fill-buckets: "+
+				"column sets are picked per row, so there is no bucket to spread rows across", this.PairBucketRows)
+		}
+		if this.PairBucketRows < 0 {
+			return fmt.Errorf("-pair-bucket-rows must be nonnegative")
+		}
+		if this.SQLUpsert {
+			return fmt.Errorf("-sql-upsert is not supported in pair mode: pair output builds its own column list per statement")
+		}
+	} else if this.PairBucketRows != 0 {
+		return fmt.Errorf("-pair-bucket-rows requires -pair-catalog (pair mode is off)")
 	}
 	if this.Segments == 0 || this.TotalRows == 0 || this.TotalRows%this.Segments != 0 {
 		return fmt.Errorf("total-rows must be positive and divisible by positive segments")
@@ -356,6 +424,18 @@ func (g *Generator) forEachSeq(ctx context.Context, fn func(seq uint64) error) e
 		}
 	}
 	return nil
+}
+
+// SeqAt returns the source sequence for the given row rank within the
+// segment. For keyseq the output order follows engine keys, so a rank maps
+// through the shared key sequence; the linear layouts use the rank directly.
+// It exists so the checker can regenerate rows in the same order (and so with
+// the same RNG consumption) as the writer did.
+func (g *Generator) SeqAt(rank uint64) uint64 {
+	if g.keySeq != nil {
+		return g.keySeq.SeqAt(rank)
+	}
+	return rank
 }
 
 // SegKeyBounds reports the [min, max] primary-key range this segment covers.
