@@ -413,6 +413,29 @@ func TestKeySeqPairSystemValues(t *testing.T) {
 	}
 }
 
+func TestPairRejectsExplicitGenericFlags(t *testing.T) {
+	base := []string{"-total-rows", "10", "-segments", "1", "-format", "sql", "-sql-table", "t",
+		"-pair-catalog", "100", "-pair-fill", "10", "-pair-raw-bytes", "96:1"}
+	for _, name := range []string{"fields", "file-cols", "fixed-cols", "index-fields", "fill", "row-width"} {
+		t.Run(name, func(t *testing.T) {
+			args := append([]string(nil), base...)
+			args = append(args, "-"+name, "1", "-out", t.TempDir()+"/seg")
+			err := Run(args)
+			if err == nil || !strings.Contains(err.Error(), "-"+name) || !strings.Contains(err.Error(), "pair mode") {
+				t.Fatalf("explicit -%s was not rejected clearly: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestGapFactorRequiresBlockedScatter(t *testing.T) {
+	err := Run([]string{"-total-rows", "10", "-segments", "1", "-scatter", "hash32", "-gap-factor", "5",
+		"-out", t.TempDir() + "/seg"})
+	if err == nil || !strings.Contains(err.Error(), "gap-factor") || !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("gap-factor with hash32 was not rejected clearly: %v", err)
+	}
+}
+
 // A pair-mode generator with per-row random column sets cannot group rows into
 // one multi-row INSERT statement: every row gets a different column list, so
 // the group breaks on the second row and each statement holds exactly one row.

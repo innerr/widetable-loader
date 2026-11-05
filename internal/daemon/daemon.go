@@ -46,13 +46,15 @@ type GenJob struct {
 	SQLMultiRow  int    `json:"sql_multi_row"`  // sql: rows per INSERT statement
 	SQLUpsert    bool   `json:"sql_upsert"`     // sql: append ON DUPLICATE KEY UPDATE
 
-	PairCatalog    int           `json:"pair_catalog"`
-	PairFill       int           `json:"pair_fill"`
-	PairBucketRows int           `json:"pair_bucket_rows"`
-	PairRawBytes   []gen.PairRaw `json:"pair_raw_bytes"`
-	PairTimeStart  int64         `json:"pair_time_start"`
-	PairTimeSpan   int64         `json:"pair_time_span"`
-	PairIndex      gen.PairIndex `json:"pair_index"`
+	PairCatalog     int                `json:"pair_catalog"`
+	PairFill        int                `json:"pair_fill"`
+	PairBucketRows  int                `json:"pair_bucket_rows"`
+	PairRawBytes    []gen.PairRaw      `json:"pair_raw_bytes"`
+	PairExtraRaw    []gen.PairExtraRaw `json:"pair_extra_raw"`
+	PairMaxRowBytes int                `json:"pair_max_row_bytes"`
+	PairTimeStart   int64              `json:"pair_time_start"`
+	PairTimeSpan    int64              `json:"pair_time_span"`
+	PairIndex       gen.PairIndex      `json:"pair_index"`
 }
 
 func (this GenJob) config() gen.Config {
@@ -64,15 +66,29 @@ func (this GenJob) config() gen.Config {
 	if gap == 0 {
 		gap = 10
 	}
-	return gen.Config{TotalRows: this.TotalRows, Segments: this.Segments, Scatter: scatter,
+	cfg := gen.Config{TotalRows: this.TotalRows, Segments: this.Segments, Scatter: scatter,
 		GapFactor: gap, Seed: this.Seed, Fields: this.Fields, FileCols: this.FileCols,
 		FixedCols: this.FixedCols, IndexFields: this.IndexFields, Fill: this.Fill,
 		RowWidth: this.RowWidth, FillBuckets: this.FillBuckets,
 		SkipHashFile: this.SkipHashFile,
-		PairCatalog:  this.PairCatalog, PairFill: this.PairFill, PairBucketRows: this.PairBucketRows,
-		PairRawDist:   this.PairRawBytes,
+		Format:       this.Format, SQLTable: this.SQLTable, SQLMultiRow: this.SQLMultiRow, SQLUpsert: this.SQLUpsert,
+		PairCatalog: this.PairCatalog, PairFill: this.PairFill, PairBucketRows: this.PairBucketRows,
+		PairRawDist: this.PairRawBytes, PairExtraRaw: this.PairExtraRaw, PairMaxRowBytes: this.PairMaxRowBytes,
 		PairTimeStart: this.PairTimeStart, PairTimeSpan: this.PairTimeSpan,
 		PairIndex: this.PairIndex}
+	cfg.ExplicitFlags = make(map[string]bool)
+	for name, value := range map[string]int{
+		"fields": this.Fields, "file-cols": this.FileCols, "fixed-cols": this.FixedCols,
+		"index-fields": this.IndexFields, "fill": this.Fill, "row-width": this.RowWidth,
+	} {
+		if value != 0 {
+			cfg.ExplicitFlags[name] = true
+		}
+	}
+	if this.GapFactor != 0 {
+		cfg.ExplicitFlags["gap-factor"] = true
+	}
+	return cfg
 }
 
 type Job struct {
@@ -232,22 +248,8 @@ func (this *Server) startGen(w http.ResponseWriter, r *http.Request) {
 	if p.Format == "" {
 		p.Format = "csv"
 	}
-	if p.Format != "csv" && p.Format != "sql" {
-		writeErr(w, 400, "format must be csv or sql")
-		return
-	}
-	if p.Format == "csv" && (p.SQLTable != "" || p.SQLMultiRow != 0 || p.SQLUpsert) {
-		writeErr(w, 400, "sql_* fields require format=sql")
-		return
-	}
-	if p.Format == "sql" {
-		if p.SQLTable == "" {
-			writeErr(w, 400, "sql format requires sql_table")
-			return
-		}
-		if p.SQLMultiRow < 1 {
-			p.SQLMultiRow = 1
-		}
+	if p.SQLMultiRow == 0 {
+		p.SQLMultiRow = 1
 	}
 	if _, err := gen.NewGenerator(p.config(), p.Segment); err != nil {
 		writeErr(w, 400, err.Error())

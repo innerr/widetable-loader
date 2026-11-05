@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -25,6 +26,12 @@ import (
 type PairRaw struct {
 	Bytes  int
 	Weight float64
+}
+
+// PairExtraRaw is an always-filled raw column with an exact byte length.
+type PairExtraRaw struct {
+	Name  string `json:"name"`
+	Bytes int    `json:"bytes"`
 }
 
 // PairIndex fixes the cardinality of the customer index fields.
@@ -46,6 +53,9 @@ const (
 	defaultPairMsBytes = 18
 	defaultPairMaBytes = 24
 )
+
+// Keep the estimated pair row below the default 64 MiB txn_max_entry_size.
+const defaultPairMaxRowBytes = 64*1024*1024 - 4
 
 // pairSystemColumns are written on every row before the field pairs. Spatial
 // columns (gP_Location, gP_TrajectoryPoints) and TTL are out of scope for the
@@ -132,21 +142,81 @@ func validatePairConfig(cfg Config) error {
 		return fmt.Errorf("pair-raw-bytes is required in pair mode")
 	}
 	total := 0.0
+	maxRawBytes := 0
 	for _, entry := range cfg.PairRawDist {
 		if entry.Bytes <= 8 || entry.Weight <= 0 {
 			return fmt.Errorf("pair-raw-bytes entries need bytes > 8 and weight > 0")
+		}
+		if entry.Bytes > maxRawBytes {
+			maxRawBytes = entry.Bytes
 		}
 		total += entry.Weight
 	}
 	if total <= 0 {
 		return fmt.Errorf("pair-raw-bytes weights must sum above zero")
 	}
-	if cfg.PairTimeSpan <= 0 {
-		return fmt.Errorf("pair-time-span must be positive")
+	maxRowBytes := cfg.PairMaxRowBytes
+	if maxRowBytes < 0 {
+		return fmt.Errorf("pair-max-row-bytes must be nonnegative")
+	}
+	if maxRowBytes == 0 {
+		maxRowBytes = defaultPairMaxRowBytes
+	}
+	dynamicRawName := regexp.MustCompile(`^xx_[0-9]{6}_raw$`)
+	dynamicValName := regexp.MustCompile(`^(ms|md|mi|mb|ma)_[0-9]{6}_val$`)
+	seenNames := make(map[string]bool, 1+len(pairSystemColumns)+len(pairIndexColumns)+len(cfg.PairExtraRaw))
+	seenNames["id"] = true
+	for _, name := range pairSystemColumns {
+		seenNames[name] = true
+	}
+	for _, name := range pairIndexColumns {
+		seenNames[name] = true
+	}
+	extraBytes := int64(0)
+	for _, entry := range cfg.PairExtraRaw {
+		if entry.Bytes < 64 {
+			return fmt.Errorf("pair-extra-raw column %q needs at least 64 bytes", entry.Name)
+		}
+		if strings.TrimSpace(entry.Name) == "" {
+			return fmt.Errorf("pair-extra-raw column name must be nonempty")
+		}
+		if strings.ContainsAny(entry.Name, "'\\,`") {
+			return fmt.Errorf("pair-extra-raw column %q contains a forbidden character", entry.Name)
+		}
+		if seenNames[entry.Name] {
+			return fmt.Errorf("pair-extra-raw column %q duplicates another generated column", entry.Name)
+		}
+		if dynamicRawName.MatchString(entry.Name) {
+			return fmt.Errorf("pair-extra-raw column %q conflicts with a dynamic pair raw column", entry.Name)
+		}
+		if dynamicValName.MatchString(entry.Name) {
+			return fmt.Errorf("pair-extra-raw column %q conflicts with a dynamic pair value column", entry.Name)
+		}
+		seenNames[entry.Name] = true
+		if int64(entry.Bytes) > int64(maxRowBytes)-extraBytes {
+			return fmt.Errorf("pair-extra-raw total bytes must not exceed %d", maxRowBytes)
+		}
+		extraBytes += int64(entry.Bytes)
 	}
 	// Negative lengths are invalid; zero means "use the default".
 	if cfg.PairMsBytes < 0 || cfg.PairMaBytes < 0 {
 		return fmt.Errorf("pair-ms-bytes and pair-ma-bytes must be nonnegative")
+	}
+	msBytes, maBytes := cfg.PairMsBytes, cfg.PairMaBytes
+	if msBytes == 0 {
+		msBytes = defaultPairMsBytes
+	}
+	if maBytes == 0 {
+		maBytes = defaultPairMaBytes
+	}
+	maxValueBytes := max(8, msBytes, maBytes)
+	estimatedPairBytes := int64(cfg.PairFill) * (int64(maxRawBytes) + int64(maxValueBytes))
+	if estimatedPairBytes > int64(maxRowBytes) || extraBytes > int64(maxRowBytes)-estimatedPairBytes {
+		return fmt.Errorf("estimated pair row bytes (%d pair data + %d extra raw) must not exceed pair-max-row-bytes %d",
+			estimatedPairBytes, extraBytes, maxRowBytes)
+	}
+	if cfg.PairTimeSpan <= 0 {
+		return fmt.Errorf("pair-time-span must be positive")
 	}
 	for name, value := range map[string]int{
 		"pair-dw-distinct":           cfg.PairIndex.DWDistinct,
@@ -230,9 +300,15 @@ func (p *pairGen) value(family string) (string, string) {
 // raw builds a valid JSON object holding the typed value plus filler, padded
 // to the sampled byte length.
 func (p *pairGen) raw(scalar string) string {
+	return p.rawSized(scalar, p.rawBytes())
+}
+
+// rawSized pads one raw JSON object to a fixed target length. Pair validation
+// ensures extra raw columns leave room for positive filler.
+func (p *pairGen) rawSized(scalar string, size int) string {
 	head := `{"v":` + scalar + `,"p":"`
 	tail := `"}`
-	pad := p.rawBytes() - len(head) - len(tail)
+	pad := size - len(head) - len(tail)
 	if pad < 0 {
 		pad = 0
 	}
@@ -315,6 +391,12 @@ func (g *Generator) NextPairs(seq uint64) ([]string, []string, error) {
 	for _, name := range pairIndexColumns {
 		cols = append(cols, name)
 		vals = append(vals, p.systemValue(name, seq))
+	}
+	for _, extra := range g.cfg.PairExtraRaw {
+		// An integer scalar keeps the 64-byte minimum independent of pair-ms-bytes.
+		scalar, _ := p.value("mi")
+		cols = append(cols, extra.Name)
+		vals = append(vals, "'"+p.rawSized(scalar, extra.Bytes)+"'")
 	}
 	for _, index := range p.pick(g.cfg.PairFill, seq) {
 		family := p.family(index)
@@ -422,13 +504,16 @@ func sameColumns(a, b []string) bool {
 }
 
 // pairColumnIndex maps every full-frame column name to its position. The
-// frame is id + system + index columns + both columns of every catalog pair,
-// in catalog id order.
-func pairColumnFrame(catalog int) []string {
-	names := make([]string, 0, 1+len(pairSystemColumns)+len(pairIndexColumns)+2*catalog)
+// frame is id + system + index columns + extra raw columns + both columns of
+// every catalog pair, in catalog id order.
+func pairColumnFrame(catalog int, extraRaw []PairExtraRaw) []string {
+	names := make([]string, 0, 1+len(pairSystemColumns)+len(pairIndexColumns)+len(extraRaw)+2*catalog)
 	names = append(names, "id")
 	names = append(names, pairSystemColumns...)
 	names = append(names, pairIndexColumns...)
+	for _, extra := range extraRaw {
+		names = append(names, extra.Name)
+	}
 	perFamily := catalog / len(pairFamilies)
 	for index := 0; index < catalog; index++ {
 		family := pairFamilies[index/perFamily]
@@ -441,7 +526,7 @@ func pairColumnFrame(catalog int) []string {
 
 // PairColumnNames returns the CSV header order for pair mode.
 func PairColumnNames(cfg Config) []string {
-	return pairColumnFrame(cfg.PairCatalog)
+	return pairColumnFrame(cfg.PairCatalog, cfg.PairExtraRaw)
 }
 
 // NextPairsRecord renders one row in the full CSV column frame: unfilled
@@ -454,7 +539,7 @@ func (g *Generator) NextPairsRecord(seq uint64) ([]string, error) {
 		return nil, fmt.Errorf("seq %d outside segment rows [%d, %d)", seq, g.row0, g.row1)
 	}
 	if g.pairFrame == nil {
-		g.pairFrame = pairColumnFrame(g.cfg.PairCatalog)
+		g.pairFrame = pairColumnFrame(g.cfg.PairCatalog, g.cfg.PairExtraRaw)
 	}
 	record := make([]string, len(g.pairFrame))
 	pos := make(map[string]int, len(g.pairFrame))
@@ -506,12 +591,16 @@ func (g *Generator) WriteCSVPairsContext(ctx context.Context, w *bufio.Writer) e
 }
 
 // RegisterPairFlags binds the pair-mode flags onto fs.
-func RegisterPairFlags(fs *flag.FlagSet, cfg *Config) *string {
+func RegisterPairFlags(fs *flag.FlagSet, cfg *Config) (*string, *string) {
 	fs.IntVar(&cfg.PairCatalog, "pair-catalog", 0,
 		"pair mode: catalog field count (0 disables); each row fills a random subset")
 	fs.IntVar(&cfg.PairFill, "pair-fill", 0, "pair mode: filled field pairs per row")
-	spec := fs.String("pair-raw-bytes", "",
+	rawSpec := fs.String("pair-raw-bytes", "",
 		`pair mode: raw column byte length distribution, e.g. "96:0.7,192:0.25,512:0.05"`)
+	extraRawSpec := fs.String("pair-extra-raw", "",
+		`pair mode: always-filled raw columns with exact byte lengths, e.g. "xx_long_1_raw:51200,xx_long_2_raw:51200"`)
+	fs.IntVar(&cfg.PairMaxRowBytes, "pair-max-row-bytes", 0,
+		"pair mode: maximum estimated row bytes including extra raw columns (0 = 64 MiB - 4)")
 	fs.Int64Var(&cfg.PairTimeStart, "pair-time-start", 0,
 		"pair mode: createTime base in milliseconds")
 	fs.Int64Var(&cfg.PairTimeSpan, "pair-time-span", 259200000,
@@ -533,7 +622,7 @@ func RegisterPairFlags(fs *flag.FlagSet, cfg *Config) *string {
 		"pair mode: rows per parentId")
 	fs.IntVar(&cfg.PairBucketRows, "pair-bucket-rows", 0,
 		"pair mode with fill-buckets: consecutive rows sharing one bucket's column set before cycling (0/1 = cycle every row; >1 enables CSV multi-row grouping)")
-	return spec
+	return rawSpec, extraRawSpec
 }
 
 // ParsePairRawDist parses the "bytes:weight,..." raw length distribution.
@@ -560,6 +649,30 @@ func ParsePairRawDist(spec string) ([]PairRaw, error) {
 			return nil, fmt.Errorf("bad pair-raw-bytes weight in %q: %v", part, err)
 		}
 		out = append(out, PairRaw{Bytes: size, Weight: weight})
+	}
+	return out, nil
+}
+
+// ParsePairExtraRaw parses "name:bytes,..." into fixed-length raw columns.
+func ParsePairExtraRaw(spec string) ([]PairExtraRaw, error) {
+	if strings.TrimSpace(spec) == "" {
+		return nil, nil
+	}
+	var out []PairExtraRaw
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pair := strings.SplitN(part, ":", 2)
+		if len(pair) != 2 {
+			return nil, fmt.Errorf("bad pair-extra-raw entry %q (want name:bytes)", part)
+		}
+		size, err := strconv.Atoi(strings.TrimSpace(pair[1]))
+		if err != nil {
+			return nil, fmt.Errorf("bad pair-extra-raw size in %q: %v", part, err)
+		}
+		out = append(out, PairExtraRaw{Name: strings.TrimSpace(pair[0]), Bytes: size})
 	}
 	return out, nil
 }

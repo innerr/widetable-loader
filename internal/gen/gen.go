@@ -48,26 +48,19 @@ func Run(args []string) error {
 	fs.IntVar(&cfg.Fill, "fill", 100, "filled declared columns per row (index fields included)")
 	fs.IntVar(&cfg.RowWidth, "row-width", 1024, "target row width in bytes")
 	fs.IntVar(&cfg.FillBuckets, "fill-buckets", 0, ">0: cycle through N pre-picked column sets instead of per-row random (enables multi-row INSERT)")
-	pairRawSpec := RegisterPairFlags(fs, &cfg)
+	pairRawSpec, pairExtraRawSpec := RegisterPairFlags(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	cfg.RecordExplicitFlags(fs)
+	cfg.Format = *format
+	cfg.SQLTable = *sqlTable
+	cfg.SQLMultiRow = *sqlMultiRow
+	cfg.SQLUpsert = *sqlUpsert
 	if cfg.TotalRows == 0 {
 		return fmt.Errorf("--total-rows is required")
 	}
-	if *format != "csv" && *format != "sql" {
-		return fmt.Errorf("unknown format %q (csv | sql)", *format)
-	}
 	sql := *format == "sql"
-	if !sql && (*sqlTable != "" || *sqlMultiRow != 1 || *sqlUpsert) {
-		return fmt.Errorf("--sql-table/--sql-multi-row/--sql-upsert require -format sql")
-	}
-	if sql && *sqlTable == "" {
-		return fmt.Errorf("-format sql requires --sql-table")
-	}
-	if *sqlMultiRow < 1 {
-		return fmt.Errorf("--sql-multi-row must be >= 1")
-	}
 	if *indexCols != "" {
 		cols, err := parseIndexCols(*indexCols)
 		if err != nil {
@@ -85,31 +78,11 @@ func Run(args []string) error {
 			return err
 		}
 		cfg.PairRawDist = spec
-		// A multi-row INSERT statement has one column list, so the rows in a
-		// group must fill exactly the same columns. With per-row random fills
-		// (fill-buckets 0) the second row always breaks the group, so the flag
-		// would silently do nothing and every statement ends up holding one row.
-		// Refuse instead of degrading quietly.
-		if *sqlMultiRow > 1 && cfg.FillBuckets == 0 {
-			return fmt.Errorf("-sql-multi-row %d has no effect in pair mode without -fill-buckets: "+
-				"per-row random column sets break the group on the second row, so every statement holds one row; "+
-				"set -fill-buckets 1 to actually group %d rows per statement, or drop -sql-multi-row",
-				*sqlMultiRow, *sqlMultiRow)
+		extraRaw, err := ParsePairExtraRaw(*pairExtraRawSpec)
+		if err != nil {
+			return err
 		}
-		// Bucket rows only matter when buckets exist, and cycling buckets per
-		// row defeats grouping -- the value below 1 changes nothing.
-		if cfg.PairBucketRows != 0 && cfg.FillBuckets == 0 {
-			return fmt.Errorf("-pair-bucket-rows %d has no effect without -fill-buckets: "+
-				"column sets are picked per row, so there is no bucket to spread rows across", cfg.PairBucketRows)
-		}
-		if cfg.PairBucketRows < 0 {
-			return fmt.Errorf("-pair-bucket-rows must be nonnegative")
-		}
-		if sql && *sqlUpsert {
-			return fmt.Errorf("-sql-upsert is not supported in pair mode: pair output builds its own column list per statement")
-		}
-	} else if cfg.PairBucketRows != 0 {
-		return fmt.Errorf("-pair-bucket-rows requires -pair-catalog (pair mode is off)")
+		cfg.PairExtraRaw = extraRaw
 	}
 
 	g, err := NewGenerator(cfg, *segment)

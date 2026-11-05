@@ -316,10 +316,11 @@ func runGen(args []string) (err error) {
 		sqlMultiRow = fs.Int("sql-multi-row", 1, "sql format: rows per INSERT statement")
 		cfg         gen.Config
 	)
-	pairRawSpec := gen.RegisterPairFlags(fs, &cfg)
+	pairRawSpec, pairExtraRawSpec := gen.RegisterPairFlags(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	cfg.RecordExplicitFlags(fs)
 	nodes, err := parseNodes(*nodesSpec)
 	if err != nil {
 		return err
@@ -340,17 +341,20 @@ func runGen(args []string) (err error) {
 	cfg.RowWidth = *rowWidth
 	cfg.FillBuckets = *fillBuckets
 	cfg.SkipHashFile = *skipHashFile
+	cfg.Format = *format
+	cfg.SQLTable = *sqlTable
+	cfg.SQLMultiRow = *sqlMultiRow
 	if cfg.PairCatalog > 0 {
 		spec, err := gen.ParsePairRawDist(*pairRawSpec)
 		if err != nil {
 			return err
 		}
 		cfg.PairRawDist = spec
-		if *format == "sql" {
-			if *sqlTable == "" {
-				return errors.New("pair mode requires -sql-table with -format sql")
-			}
+		extraRaw, err := gen.ParsePairExtraRaw(*pairExtraRawSpec)
+		if err != nil {
+			return err
 		}
+		cfg.PairExtraRaw = extraRaw
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -397,29 +401,35 @@ func runGen(args []string) (err error) {
 			defer wg.Done()
 			for seg := info.from; seg < info.to; seg++ {
 				body := map[string]interface{}{
-					"out":              fmt.Sprintf("%s/seg-%d%s", *outDir, seg, segmentExt),
-					"segment":          seg,
-					"segments":         *segments,
-					"total_rows":       *totalRows,
-					"scatter":          *scatter,
-					"gap_factor":       *gapFactor,
-					"seed":             *seed,
-					"fields":           *fields,
-					"file_cols":        *fileCols,
-					"fixed_cols":       *fixedCols,
-					"index_fields":     *indexFlds,
-					"fill":             *fill,
-					"row_width":        *rowWidth,
-					"fill_buckets":     *fillBuckets,
-					"skip_hash_file":   *skipHashFile,
-					"format":           *format,
-					"pair_catalog":     cfg.PairCatalog,
-					"pair_fill":        cfg.PairFill,
-					"pair_bucket_rows": cfg.PairBucketRows,
-					"pair_raw_bytes":   cfg.PairRawDist,
-					"pair_time_start":  cfg.PairTimeStart,
-					"pair_time_span":   cfg.PairTimeSpan,
-					"pair_index":       cfg.PairIndex,
+					"out":                fmt.Sprintf("%s/seg-%d%s", *outDir, seg, segmentExt),
+					"segment":            seg,
+					"segments":           *segments,
+					"total_rows":         *totalRows,
+					"scatter":            *scatter,
+					"seed":               *seed,
+					"fill_buckets":       *fillBuckets,
+					"skip_hash_file":     *skipHashFile,
+					"format":             *format,
+					"pair_catalog":       cfg.PairCatalog,
+					"pair_fill":          cfg.PairFill,
+					"pair_bucket_rows":   cfg.PairBucketRows,
+					"pair_raw_bytes":     cfg.PairRawDist,
+					"pair_extra_raw":     cfg.PairExtraRaw,
+					"pair_max_row_bytes": cfg.PairMaxRowBytes,
+					"pair_time_start":    cfg.PairTimeStart,
+					"pair_time_span":     cfg.PairTimeSpan,
+					"pair_index":         cfg.PairIndex,
+				}
+				if *scatter == "blocked" {
+					body["gap_factor"] = *gapFactor
+				}
+				if cfg.PairCatalog == 0 {
+					body["fields"] = *fields
+					body["file_cols"] = *fileCols
+					body["fixed_cols"] = *fixedCols
+					body["index_fields"] = *indexFlds
+					body["fill"] = *fill
+					body["row_width"] = *rowWidth
 				}
 				if *format == "sql" {
 					body["sql_table"] = *sqlTable
