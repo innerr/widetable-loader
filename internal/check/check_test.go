@@ -51,6 +51,30 @@ func TestPairValueComparison(t *testing.T) {
 	}
 }
 
+func TestPairJSONColumnComparison(t *testing.T) {
+	jsonCols := map[string]bool{"mj_long_1": true}
+	cases := []struct {
+		name      string
+		column    string
+		want, got string
+		equal     bool
+	}{
+		{name: "JSON key order", column: "mj_long_1", want: `'{"a":1,"b":2}'`, got: `{"b":2,"a":1}`, equal: true},
+		{name: "JSON whitespace", column: "mj_long_1", want: `'{"a":1,"b":2}'`, got: `{ "a": 1, "b": 2 }`, equal: true},
+		{name: "JSON number format", column: "mj_long_1", want: `'{"n":1.0}'`, got: `{"n":1}`, equal: true},
+		{name: "JSON different value", column: "mj_long_1", want: `'{"a":1}'`, got: `{"a":2}`, equal: false},
+		{name: "text key order", column: "xx_long_1_raw", want: `'{"a":1,"b":2}'`, got: `{"b":2,"a":1}`, equal: false},
+		{name: "text whitespace", column: "xx_long_1_raw", want: `'{"a":1,"b":2}'`, got: `{"a":1, "b":2}`, equal: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pairColumnValueEqual(tc.column, tc.want, tc.got, jsonCols); got != tc.equal {
+				t.Fatalf("pairColumnValueEqual(%q, %q, %q) = %v, want %v", tc.column, tc.want, tc.got, got, tc.equal)
+			}
+		})
+	}
+}
+
 func TestSampleOffsetsLimitedToHead(t *testing.T) {
 	offs := sampleOffsets(1000, 1, 3, 8, 20)
 	if len(offs) != 8 {

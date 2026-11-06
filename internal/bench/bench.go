@@ -52,10 +52,11 @@ type Params struct {
 	Fill      int `json:"fill"`       // columns written per split row (<= file cols)
 	// 宽表实际列清单（逗号分隔，不含 id）与其中的数字列。为空时用 gen 生成的
 	// c000001.. 列名，仅适用于声明列形态的表。
-	Columns  string `json:"columns"`
-	Numeric  string `json:"numeric_columns"`
-	RowWidth int    `json:"row_width"`
-	Seed     uint64 `json:"seed"`
+	Columns       string   `json:"columns"`
+	Numeric       string   `json:"numeric_columns"`
+	LargeJSONCols []string `json:"large_json_cols"`
+	RowWidth      int      `json:"row_width"`
+	Seed          uint64   `json:"seed"`
 }
 
 // Report is one snapshot of a bench run.
@@ -104,7 +105,31 @@ func (this Params) columnList(cfg gen.Config) ([]string, map[string]bool) {
 	return cols, numeric
 }
 
+func (this Params) largeJSONColumns() ([]string, error) {
+	if len(this.LargeJSONCols) == 0 {
+		return []string{largeJSONColumn1, largeJSONColumn2}, nil
+	}
+	if len(this.LargeJSONCols) != 2 {
+		return nil, fmt.Errorf("large-json-cols requires exactly two column names")
+	}
+	cols := make([]string, 2)
+	for i, name := range this.LargeJSONCols {
+		cols[i] = strings.TrimSpace(name)
+		if cols[i] == "" {
+			return nil, fmt.Errorf("large-json-cols column names must not be empty")
+		}
+	}
+	if cols[0] == cols[1] {
+		return nil, fmt.Errorf("large-json-cols column names must be different")
+	}
+	return cols, nil
+}
+
 func (this Params) Validate() error {
+	largeJSONCols, err := this.largeJSONColumns()
+	if err != nil {
+		return err
+	}
 	writeMode := this.WriteMode
 	if writeMode == "" {
 		writeMode = "new"
@@ -124,7 +149,7 @@ func (this Params) Validate() error {
 	}
 	if writeMode == "existing" {
 		declared, _ := this.columnList(cfg)
-		return validateExistingColumns(declared)
+		return validateExistingColumns(declared, largeJSONCols)
 	}
 	if this.ReadRatio < 1 {
 		if this.GapFactor <= 1 || this.TotalRows > uint64(1<<63-1)/this.GapFactor {
@@ -141,6 +166,7 @@ func (this Params) Validate() error {
 func Run(args []string) error {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	var p Params
+	largeJSONCols := largeJSONColumn1 + "," + largeJSONColumn2
 	fs.StringVar(&p.DSN, "dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:port)/db")
 	fs.StringVar(&p.Table, "table", "", "target table")
 	fs.IntVar(&p.Threads, "threads", 16, "concurrent client threads")
@@ -149,6 +175,7 @@ func Run(args []string) error {
 	fs.Float64Var(&p.ReadRatio, "read-ratio", 0.5, "read fraction 0..1 (rest is writes)")
 	fs.StringVar(&p.WriteMode, "write-mode", "new", "write target: new gap keys | existing occupied keys")
 	fs.StringVar(&p.Columns, "columns", "", "comma-separated declared columns to write, excluding id")
+	fs.StringVar(&largeJSONCols, "large-json-cols", largeJSONCols, "comma-separated names of the two large JSON columns")
 	fs.Uint64Var(&p.Segments, "segments", 0, "segment count the data was generated with")
 	fs.Uint64Var(&p.TotalRows, "total-rows", 0, "total rows the data was generated with")
 	fs.Uint64Var(&p.GapFactor, "gap-factor", 10, "blocked: segment stride = rows-per-segment * gap-factor")
@@ -158,6 +185,10 @@ func Run(args []string) error {
 	fs.IntVar(&p.RowWidth, "row-width", 1024, "target row width (value sizing)")
 	fs.Uint64Var(&p.Seed, "seed", 1, "random seed")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p.LargeJSONCols = strings.Split(largeJSONCols, ",")
+	if _, err := p.largeJSONColumns(); err != nil {
 		return err
 	}
 	gapFactorSet := false
@@ -192,6 +223,10 @@ func Run(args []string) error {
 // the end. ctx cancellation stops the run early.
 func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 	if err := p.Validate(); err != nil {
+		return err
+	}
+	largeJSONCols, err := p.largeJSONColumns()
+	if err != nil {
 		return err
 	}
 	if onReport == nil {
@@ -265,7 +300,7 @@ func RunWithReport(ctx context.Context, p Params, onReport func(Report)) error {
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
-			if err := runThread(ctx, p, cfg, rps, gapLo, gapHi, layouts, rng, measureStart,
+			if err := runThread(ctx, p, cfg, largeJSONCols, rps, gapLo, gapHi, layouts, rng, measureStart,
 				&reads, &writes, &errs, &readBytes, &writeRows, &writeStmts, &latencies); err != nil && ctx.Err() == nil {
 				errCh <- err
 				cancel()
@@ -357,7 +392,7 @@ func percentiles(lats []float64) (p50, p95, p99 float64) {
 }
 
 // runThread loops until ctx is done, mixing point reads and split writes.
-func runThread(ctx context.Context, p Params, cfg gen.Config, rps, gapLo, gapHi uint64,
+func runThread(ctx context.Context, p Params, cfg gen.Config, largeJSONCols []string, rps, gapLo, gapHi uint64,
 	layouts []genkey.Layout, rng *rand.Rand, measureStart time.Time,
 	reads, writes, errs, readBytes, writeRows, writeStmts *int64, latencies *latencySamples) error {
 	db, err := sql.Open("mysql", p.DSN)
@@ -389,10 +424,10 @@ func runThread(ctx context.Context, p Params, cfg gen.Config, rps, gapLo, gapHi 
 			var rows, statements int
 			var err error
 			if p.WriteMode == "existing" {
-				rows, statements, err = existingWrite(ctx, db, p.Table, declared, numeric, rps,
+				rows, statements, err = existingWrite(ctx, db, p.Table, declared, numeric, largeJSONCols, rps,
 					layouts, rng, cfg, errs)
 			} else {
-				rows, statements, err = splitWrite(ctx, db, p.Table, declared, numeric, gapLo, gapHi,
+				rows, statements, err = splitWrite(ctx, db, p.Table, declared, numeric, largeJSONCols, gapLo, gapHi,
 					layouts, rng, cfg, errs)
 			}
 			if err != nil {
@@ -464,20 +499,20 @@ type writeStatement struct {
 	columns []string
 }
 
-func validateExistingColumns(declared []string) error {
+func validateExistingColumns(declared, largeJSONCols []string) error {
 	found := make(map[string]bool, 2)
 	for _, name := range declared {
-		if name == largeJSONColumn1 || name == largeJSONColumn2 {
+		if name == largeJSONCols[0] || name == largeJSONCols[1] {
 			found[name] = true
 		}
 	}
 	if len(found) != 2 {
 		return fmt.Errorf("-write-mode existing requires -columns to include %s and %s; the case must contain both large JSON columns",
-			largeJSONColumn1, largeJSONColumn2)
+			largeJSONCols[0], largeJSONCols[1])
 	}
 	if len(declared) < 3 {
 		return fmt.Errorf("-write-mode existing requires at least one small column besides %s and %s",
-			largeJSONColumn1, largeJSONColumn2)
+			largeJSONCols[0], largeJSONCols[1])
 	}
 	return nil
 }
@@ -485,12 +520,12 @@ func validateExistingColumns(declared []string) error {
 // buildWriteStatements builds 2-3 non-overlapping column subsets for one key.
 // Existing-key writes put both large JSON columns in the first subset.
 func buildWriteStatements(table string, id uint64, declared []string, numeric map[string]bool,
-	rng *rand.Rand, cfg gen.Config, writeMode string) ([]writeStatement, error) {
+	largeJSONCols []string, rng *rand.Rand, cfg gen.Config, writeMode string) ([]writeStatement, error) {
 	keyword := "INSERT"
 	existing := writeMode == "existing"
 	if existing {
 		keyword = "UPSERT"
-		if err := validateExistingColumns(declared); err != nil {
+		if err := validateExistingColumns(declared, largeJSONCols); err != nil {
 			return nil, err
 		}
 	} else if writeMode != "new" {
@@ -501,7 +536,7 @@ func buildWriteStatements(table string, id uint64, declared []string, numeric ma
 	perm := rng.Perm(len(declared))
 	if existing {
 		forced := make([]int, 0, 2)
-		for _, name := range []string{largeJSONColumn1, largeJSONColumn2} {
+		for _, name := range largeJSONCols {
 			for _, index := range perm {
 				if declared[index] == name {
 					forced = append(forced, index)
@@ -511,7 +546,7 @@ func buildWriteStatements(table string, id uint64, declared []string, numeric ma
 		}
 		remaining := make([]int, 0, len(perm)-2)
 		for _, index := range perm {
-			if declared[index] != largeJSONColumn1 && declared[index] != largeJSONColumn2 {
+			if declared[index] != largeJSONCols[0] && declared[index] != largeJSONCols[1] {
 				remaining = append(remaining, index)
 			}
 		}
@@ -541,7 +576,7 @@ func buildWriteStatements(table string, id uint64, declared []string, numeric ma
 			colNames = append(colNames, name)
 			placeholders = append(placeholders, "?")
 			statement.columns = append(statement.columns, name)
-			statement.args = append(statement.args, benchColumn(name, numeric[name], rng, cfg, len(subset)))
+			statement.args = append(statement.args, benchColumn(name, numeric[name], largeJSONCols, rng, cfg, len(subset)))
 		}
 		statement.query = fmt.Sprintf("%s INTO %s (%s) VALUES (%s)", keyword,
 			sqlutil.QuoteIdentifier(table), strings.Join(colNames, ","), strings.Join(placeholders, ","))
@@ -554,7 +589,7 @@ func buildWriteStatements(table string, id uint64, declared []string, numeric ma
 // written by 2-3 INSERT statements that split its column subset, so a row costs
 // several statements but only one row in the table.
 func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string, numeric map[string]bool,
-	gapLo, gapHi uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
+	largeJSONCols []string, gapLo, gapHi uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
 	errs *int64) (rows int, statements int, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -570,7 +605,7 @@ func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string
 			seq = seg*cfg.RowsPerSeg() + cfg.RowsPerSeg() + rng.Uint64()%(cfg.Stride()-cfg.RowsPerSeg())
 		}
 		id := layouts[seg].ID(seq)
-		built, err := buildWriteStatements(table, id, declared, numeric, rng, cfg, "new")
+		built, err := buildWriteStatements(table, id, declared, numeric, largeJSONCols, rng, cfg, "new")
 		if err != nil {
 			return rows, statements, err
 		}
@@ -595,7 +630,7 @@ func splitWrite(ctx context.Context, db *sql.DB, table string, declared []string
 // existingWrite updates 2-3 occupied keys per transaction. Each key receives
 // 2-3 UPSERT statements, including one statement with both large JSON columns.
 func existingWrite(ctx context.Context, db *sql.DB, table string, declared []string, numeric map[string]bool,
-	rps uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
+	largeJSONCols []string, rps uint64, layouts []genkey.Layout, rng *rand.Rand, cfg gen.Config,
 	errs *int64) (rows int, statements int, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -608,7 +643,7 @@ func existingWrite(ctx context.Context, db *sql.DB, table string, declared []str
 		seg := rng.Uint64() % cfg.Segments
 		seq := seg*rps + rng.Uint64()%rps
 		id := layouts[seg].ID(seq)
-		built, err := buildWriteStatements(table, id, declared, numeric, rng, cfg, "existing")
+		built, err := buildWriteStatements(table, id, declared, numeric, largeJSONCols, rng, cfg, "existing")
 		if err != nil {
 			return rows, statements, err
 		}
@@ -640,8 +675,8 @@ func workloadError(ctx context.Context, errs *int64, action string, err error) e
 // gets a short string, and a dynamic value/raw pair gets the shape gen writes.
 // Spreading RowWidth over all columns would overflow VARCHAR and bigint
 // columns on the customer table (seen with --row-width 120000).
-func benchColumn(name string, numeric bool, rng *rand.Rand, cfg gen.Config, count int) any {
-	if name == largeJSONColumn1 || name == largeJSONColumn2 {
+func benchColumn(name string, numeric bool, largeJSONCols []string, rng *rand.Rand, cfg gen.Config, count int) any {
+	if name == largeJSONCols[0] || name == largeJSONCols[1] {
 		return benchLargeJSONValue(rng)
 	}
 	if numeric || name == "pgId" || name == "parentId" || name == "dwId" ||

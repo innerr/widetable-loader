@@ -33,12 +33,13 @@ import (
 func Run(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var (
-		dsn         = fs.String("dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:port)/db")
-		table       = fs.String("table", "", "target table")
-		cfg         gen.Config
-		sampleK     = fs.Int("sample-per-segment", 8, "sampled rows per segment")
-		sampleHead  = fs.Int("sample-head", 0, "limits regeneration work; sampled rows come from the head of each segment (0 = unlimited)")
-		maxSegments = fs.Int("max-segments", 0, "maximum segments to check from the start (0 = all segments)")
+		dsn          = fs.String("dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:port)/db")
+		table        = fs.String("table", "", "target table")
+		cfg          gen.Config
+		sampleK      = fs.Int("sample-per-segment", 8, "sampled rows per segment")
+		sampleHead   = fs.Int("sample-head", 0, "limits regeneration work; sampled rows come from the head of each segment (0 = unlimited)")
+		maxSegments  = fs.Int("max-segments", 0, "maximum segments to check from the start (0 = all segments)")
+		jsonColsSpec = fs.String("json-cols", "", "comma-separated column names to compare as JSON DOMs")
 	)
 	fs.Uint64Var(&cfg.TotalRows, "total-rows", 0, "total rows across all segments (must match gen)")
 	fs.Uint64Var(&cfg.Segments, "segments", 8, "total segment count (must match gen)")
@@ -87,6 +88,7 @@ func Run(args []string) error {
 	if *maxSegments < 0 {
 		return fmt.Errorf("max-segments must not be negative")
 	}
+	jsonCols := parseJSONColumns(*jsonColsSpec)
 
 	db, err := sql.Open("mysql", *dsn)
 	if err != nil {
@@ -97,7 +99,7 @@ func Run(args []string) error {
 	fails := 0
 
 	if cfg.PairCatalog > 0 {
-		return runPairCheck(db, *table, cfg, *sampleK, *sampleHead, *maxSegments)
+		return runPairCheck(db, *table, cfg, *sampleK, *sampleHead, *maxSegments, jsonCols)
 	}
 
 	// 1. Row count.
@@ -144,7 +146,7 @@ func Run(args []string) error {
 
 		for _, off := range offs {
 			rec := expected[off]
-			ok := checkRow(db, *table, colList, colNames, cfg, rec)
+			ok := checkRow(db, *table, colList, colNames, cfg, rec, jsonCols)
 			if !ok {
 				fails++
 			}
@@ -162,6 +164,16 @@ func Run(args []string) error {
 	}
 	fmt.Println("check PASSED")
 	return nil
+}
+
+func parseJSONColumns(spec string) map[string]bool {
+	cols := map[string]bool{}
+	for _, name := range strings.Split(spec, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			cols[name] = true
+		}
+	}
+	return cols
 }
 
 func segmentLimit(segments uint64, maxSegments int) uint64 {
@@ -197,7 +209,7 @@ func sampleOffsets(rowsPerSeg, seed, seg uint64, sampleK, sampleHead int) []uint
 
 // checkRow compares one expected record against the stored row.
 // record layout: [id, f1..fF, c000001..cFileCols].
-func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Config, rec []string) bool {
+func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Config, rec []string, jsonCols map[string]bool) bool {
 	id := rec[0]
 	rows, err := db.Query(fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", colList, sqlutil.QuoteIdentifier(table)), id)
 	if err != nil {
@@ -234,7 +246,13 @@ func checkRow(db *sql.DB, table, colList string, colNames []string, cfg gen.Conf
 		if want == "" {
 			continue
 		}
-		if !equalValue(i, cfg, want, got) {
+		valuesEqual := false
+		if jsonCols[name] {
+			valuesEqual = jsonValueEqual(want, got)
+		} else {
+			valuesEqual = equalValue(i, cfg, want, got)
+		}
+		if !valuesEqual {
 			fmt.Printf("FAIL id %s col %s: value mismatch (want %.40q, got %.40q)\n", id, name, want, got)
 			ok = false
 		}
@@ -252,11 +270,15 @@ func equalValue(idx int, cfg gen.Config, want, got string) bool {
 		b, errB := strconv.ParseFloat(got, 64)
 		return errA == nil && errB == nil && math.Abs(a-b) <= 1e-12*math.Max(1, math.Abs(a))
 	case 4:
-		var a, b any
-		return json.Unmarshal([]byte(want), &a) == nil && json.Unmarshal([]byte(got), &b) == nil && reflect.DeepEqual(a, b)
+		return jsonValueEqual(want, got)
 	default:
 		return want == got
 	}
+}
+
+func jsonValueEqual(want, got string) bool {
+	var a, b any
+	return json.Unmarshal([]byte(want), &a) == nil && json.Unmarshal([]byte(got), &b) == nil && reflect.DeepEqual(a, b)
 }
 
 // probeIndex point-queries the first indexed declared column and requires

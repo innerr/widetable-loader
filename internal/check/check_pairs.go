@@ -16,7 +16,7 @@ import (
 	"github.com/innerr/widetable-loader/internal/sqlutil"
 )
 
-func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK, sampleHead, maxSegments int) error {
+func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK, sampleHead, maxSegments int, jsonCols map[string]bool) error {
 	fails := 0
 	var cnt uint64
 	if err := db.QueryRow("SELECT COUNT(*) FROM " + sqlutil.QuoteIdentifier(table)).Scan(&cnt); err != nil {
@@ -57,7 +57,7 @@ func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK, sampleHead,
 		}
 		for _, off := range offs {
 			row := expected[off]
-			if !checkPairRow(db, table, row.cols, row.vals) {
+			if !checkPairRow(db, table, row.cols, row.vals, jsonCols) {
 				fails++
 			}
 			if !probePairIndex(db, table, row.cols, row.vals) {
@@ -76,7 +76,7 @@ func runPairCheck(db *sql.DB, table string, cfg gen.Config, sampleK, sampleHead,
 // checkPairRow compares every generated column of one row against the stored
 // row. Only the generated columns are selected; the stored row also carries
 // columns this generator does not write.
-func checkPairRow(db *sql.DB, table string, cols, vals []string) bool {
+func checkPairRow(db *sql.DB, table string, cols, vals []string, jsonCols map[string]bool) bool {
 	quoted := make([]string, len(cols))
 	for i, name := range cols {
 		quoted[i] = sqlutil.QuoteIdentifier(name)
@@ -99,7 +99,7 @@ func checkPairRow(db *sql.DB, table string, cols, vals []string) bool {
 			fmt.Printf("FAIL id %s column %s: stored NULL, want %s\n", vals[0], name, vals[i])
 			return false
 		}
-		if !pairValueEqual(vals[i], stored[i].String) {
+		if !pairColumnValueEqual(name, vals[i], stored[i].String, jsonCols) {
 			fmt.Printf("FAIL id %s column %s: got %q, want %q\n",
 				vals[0], name, stored[i].String, vals[i])
 			return false
@@ -149,6 +149,13 @@ func probePairIndex(db *sql.DB, table string, cols, vals []string) bool {
 		fmt.Printf("FAIL index probe id %s: dataUniqueId %s did not return this row\n", id, unique)
 	}
 	return found
+}
+
+func pairColumnValueEqual(name, want, got string, jsonCols map[string]bool) bool {
+	if jsonCols[name] {
+		return jsonValueEqual(strings.Trim(want, "'"), got)
+	}
+	return pairValueEqual(want, got)
 }
 
 // pairValueEqual compares a generated SQL literal with the stored text.
